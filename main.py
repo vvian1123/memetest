@@ -543,11 +543,12 @@ class MemeMaster(Star):
             "summary_threshold": 40, "proactive_interval": 0,
             "quiet_start": 23, "quiet_end": 7,
             "delay_base": 0.5, "delay_factor": 0.1,
-            "ai_prompt": "判断这张图是否适合做表情包。适合回YES并给出<名称>:说明，不适合回NO。"
+            "web_token": "admin123", # 确保有默认token
+            "ai_prompt": "判断这张图是否适合做表情包。适合回YES并给出<名称>:说明，不适合回NO。",
+            "smtp_host": "", "smtp_user": "", "smtp_pass": "", "email_to": "" # 默认设置为空字符串
         }
         if os.path.exists(self.config_file):
             try:
-                self.config_mtime = os.path.getmtime(self.config_file)
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     content = json.load(f)
                     default.update(content)
@@ -930,12 +931,15 @@ class MemeMaster(Star):
             new_conf = await r.json()
             for k, v in new_conf.items():
                 if k in ['web_token', 'ai_prompt', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to']:
-                    self.local_config[k] = str(v)
+                    # 关键修复：如果 v 是 None 或者 字符串 "None"，就存为空字符串
+                    val = str(v) if v is not None else ""
+                    if val.lower() == "none": val = ""
+                    self.local_config[k] = val
                 else:
                     try:
-                        self.local_config[k] = float(v)
-                    except:
-                        pass
+                        if v is not None and str(v).strip() != "" and str(v).lower() != "none":
+                            self.local_config[k] = float(v)
+                    except: pass
             self.save_config()
             return web.Response(text="ok")
         except Exception as e:
