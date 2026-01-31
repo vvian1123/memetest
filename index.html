@@ -212,13 +212,15 @@
         </div>
     </div>
     
-    <div class="modal-overlay" id="settingsModal">
+   <div class="modal-overlay" id="settingsModal">
         <div class="modal">
             <h3 style="margin:0 0 20px 0;">配置中心</h3>
+            
             <div class="tabs">
                 <div class="tab active" onclick="switchTab('tab-meme', this)">图库</div>
-                <div class="tab" onclick="switchTab('tab-logic', this)">逻辑</div>
+                <div class="tab" onclick="switchTab('tab-memory', this)">🧠 记忆</div> <div class="tab" onclick="switchTab('tab-logic', this)">逻辑</div>
             </div>
+
             <div id="tab-meme" class="tab-content active">
                 <div class="form-group"><label>发图概率 (%)</label><input type="number" id="conf_reply_prob"></div>
                 <div class="form-group"><label>存图冷却 (秒)</label><input type="number" id="conf_auto_save_cooldown"></div>
@@ -227,48 +229,59 @@
                     <textarea id="conf_ai_prompt" style="height:100px; font-family:monospace; font-size:0.85rem;" placeholder="你可以在这里自定义存图时的判断逻辑..."></textarea>
                 </div>
                 <button class="btn-primary" style="background:#fff7ed; color:#d97706;" onclick="slimImages()">⚡ 一键瘦身</button>
+                
+                <div style="margin-top:20px; border-top:1px dashed #e2e8f0; padding-top:15px;">
+                    <h4 style="margin:0 0 10px 0; font-size:0.9rem; color:#64748b;">📦 旧数据迁移</h4>
+                    <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:10px;">上传旧版 memes.json / memory.txt / buffer.json</div>
+                    <input type="file" id="legacyInput" multiple style="display:none" onchange="handleLegacyImport()">
+                    <button class="btn-primary" style="background:#f0f9ff; color:#0369a1;" onclick="document.getElementById('legacyInput').click()">📥 导入旧备份文件</button>
+                </div>
             </div>
+
+            <div id="tab-memory" class="tab-content">
+                <div style="background:#fffbeb; padding:15px; border-radius:16px; margin-bottom:20px; color:#92400e; font-size:0.9rem;">
+                    📌 <strong>核心记忆 (Sticky Notes)</strong><br>
+                    最高优先级注入。适合记录：纪念日、喜好、雷点、生理周期等。
+                </div>
+                <div style="display:flex; gap:10px; margin-bottom:20px;">
+                    <input type="text" id="newStickyInput" placeholder="例如: 纪念日是5月20日" 
+                           style="flex:1; padding:12px; border:2px solid #e2e8f0; border-radius:16px; outline:none;">
+                    <button onclick="addSticky()" class="btn-primary" style="width:auto; margin:0; background:#f59e0b;">添加</button>
+                </div>
+                <div id="stickyList" style="display:flex; flex-direction:column; gap:10px; max-height:300px; overflow-y:auto;">
+                    </div>
+            </div>
+
             <div id="tab-logic" class="tab-content">
                 <div class="form-group"><label>防抖等待 (秒)</label><input type="number" id="conf_debounce_time"></div>
                 <div class="form-group"><label>基础延迟 (秒)</label><input type="number" id="conf_delay_base"></div>
                 <div class="form-group"><label>字数延迟系数</label><input type="number" id="conf_delay_factor"></div>
-                
                 <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
                 <div style="display:flex; gap:10px;">
                     <div class="form-group">
-                        <label>记忆注入频率 (每N条)</label>
-                        <input type="number" id="conf_memory_interval" placeholder="20">
-                        <div class="hint">间隔越长越省Token，但可能忘事</div>
+                        <label>记忆注入 (每N条)</label>
+                        <input type="number" id="conf_memory_interval">
                     </div>
                     <div class="form-group">
-                        <label>总结触发阈值 (条数)</label>
-                        <input type="number" id="conf_summary_threshold" placeholder="40">
-                        <div class="hint">每积攒多少条对话写一次日记</div>
+                        <label>总结阈值 (条数)</label>
+                        <input type="number" id="conf_summary_threshold">
                     </div>
                 </div>
-
                 <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
-                <div class="form-group">
-                    <label>主动聊天间隔 (分钟, 0为关闭)</label>
-                    <input type="number" id="conf_proactive_interval">
-                </div>
+                <div class="form-group"><label>主动聊天 (分)</label><input type="number" id="conf_proactive_interval"></div>
                 <div style="display:flex; gap:10px;">
-                    <div class="form-group">
-                        <label>静默开始 (小时)</label>
-                        <input type="number" id="conf_quiet_start" placeholder="23">
-                    </div>
-                    <div class="form-group">
-                        <label>静默结束 (小时)</label>
-                        <input type="number" id="conf_quiet_end" placeholder="7">
-                    </div>
+                    <div class="form-group"><label>静默开始</label><input type="number" id="conf_quiet_start"></div>
+                    <div class="form-group"><label>静默结束</label><input type="number" id="conf_quiet_end"></div>
                 </div>
             </div>
+
             <div style="display:flex; justify-content:space-between; margin-top:25px;">
                 <button class="btn-ghost" onclick="closeSettings()">取消</button>
                 <button class="btn-primary" onclick="saveSettings()" style="width:auto; margin-top:0; padding:12px 30px;">保存</button>
             </div>
         </div>
     </div>
+    
 
     <script>
         const rawData = {{MEME_DATA}}; 
@@ -419,6 +432,71 @@
             await fetch(`/batch_delete?token=${token}`, {method:'POST', body:JSON.stringify({filenames:Array.from(state.selected)})});
             state.selected.forEach(fn => delete rawData[fn]); exitSelectMode(); process(); render(); showToast('删除成功');
         }
+        // === 新增：记忆管理 JS ===
+    async function loadStickies() {
+        const list = document.getElementById('stickyList');
+        list.innerHTML = '<div style="text-align:center; color:#94a3b8;">加载中... 🧠</div>';
+        try {
+            const res = await fetch(`/get_stickies?token=${token}`);
+            const data = await res.json();
+            list.innerHTML = '';
+            if(data.length === 0) {
+                list.innerHTML = '<div style="text-align:center; color:#cbd5e1; padding:20px;">暂无核心记忆</div>';
+                return;
+            }
+            data.forEach(item => {
+                const div = document.createElement('div');
+                div.style.cssText = "background:white; padding:12px; border-radius:12px; border:1px solid #f1f5f9; display:flex; align-items:center;";
+                div.innerHTML = `
+                    <div contenteditable="true" onblur="editSticky(${item.id}, this)" style="flex:1; outline:none; margin-right:10px; color:#334155;">${item.content}</div>
+                    <button onclick="delSticky(${item.id})" style="border:none; background:none; cursor:pointer; opacity:0.5;">🗑️</button>
+                `;
+                list.appendChild(div);
+            });
+        } catch(e) { list.innerHTML = '加载失败'; }
+    }
+
+    async function addSticky() {
+        const val = document.getElementById('newStickyInput').value.trim();
+        if(!val) return;
+        await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'add', content:val})});
+        document.getElementById('newStickyInput').value = ''; loadStickies();
+    }
+    async function delSticky(id) {
+        if(confirm('🗑️ 确定删除吗？')) {
+            await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'delete', id:id})});
+            loadStickies();
+        }
+    }
+    async function editSticky(id, el) {
+        await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'edit', id:id, content:el.innerText})});
+        showToast('已更新');
+    }
+    
+    // === 新增：旧数据导入 JS ===
+    async function handleLegacyImport() {
+        const files = document.getElementById('legacyInput').files;
+        if(!files.length) return;
+        const fd = new FormData();
+        for(let f of files) {
+            if(f.name.includes('meme')) fd.append('memes_json', f);
+            else if(f.name.includes('memory')) fd.append('memory_txt', f);
+            else if(f.name.includes('buffer')) fd.append('buffer_json', f);
+        }
+        showToast('正在导入...');
+        try {
+            const res = await (await fetch(`/import_legacy?token=${token}`, {method:'POST', body:fd})).text();
+            alert(res);
+            location.reload();
+        } catch(e) { alert('导入失败'); }
+    }
+
+    // === 修改切换 Tab 的逻辑 ===
+    const _oldSwitch = switchTab;
+    switchTab = function(id, el) {
+        _oldSwitch(id, el);
+        if(id === 'tab-memory') loadStickies();
+    }
         init();
     </script>
 </body>
