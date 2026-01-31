@@ -8,6 +8,7 @@ import aiohttp
 import difflib
 import zipfile
 import sqlite3
+import jieba
 import io
 import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -188,21 +189,22 @@ class MemeMaster(Star):
             # 1. 取出核心规则 (永远置顶)
             c.execute("SELECT content FROM memories WHERE type='sticky' ORDER BY importance DESC")
             stickies = [row['content'] for row in c.fetchall()]
+
+            related_memories = []
             
-            # 2. 联想召回 (搜关键词 + 搜内容)
+            # 2. 联想召回
             related_memories = []
             if current_query:
-                # 简单分词：去掉“我你他”这种无效词
-                query_words = [w for w in current_query if w not in "我你他的是了很吗？?"]
+                # 使用 jieba 进行搜索引擎模式分词，并过滤掉单字（停用词）
+                query_words = [w for w in jieba.cut_for_search(current_query) if len(w) > 1]
+    
                 if query_words:
                     conditions = []
                     params = []
                     for w in query_words:
-                        if len(w) >= 1:
-                            # 既搜关键词，也搜内容 (这样那一大坨旧记忆也能被搜到！)
-                            conditions.append("(keywords LIKE ? OR content LIKE ?)")
-                            params.extend([f"%{w}%", f"%{w}%"])
-                    
+                        conditions.append("(keywords LIKE ? OR content LIKE ?)")
+                        params.extend([f"%{w}%", f"%{w}%"])
+        
                     if conditions:
                         # 限制只找最相关的 3 条
                         sql = f"SELECT content FROM memories WHERE type='fragment' AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 3"
@@ -925,9 +927,19 @@ class MemeMaster(Star):
         if not self.check_auth(r): return web.Response(status=403)
         d=await r.json(); self.data[d['filename']]['tags']=d['tags']; self.save_data(); return web.Response(text="ok")
     async def h_gcf(self,r): return web.json_response(self.local_config)
-    async def h_ucf(self,r):
+    async def h_ucf(self, r):
         if not self.check_auth(r): return web.Response(status=403)
-        self.local_config.update(await r.json()); self.save_config(); return web.Response(text="ok")
+        new_conf = await r.json()
+        for k, v in new_conf.items():
+            if k in ['web_token', 'ai_prompt']:
+                self.local_config[k] = str(v)
+            else:
+                try: self.local_config[k] = float(v)
+                    except: pass
+                        
+        self.save_config()
+        return web.Response(text="ok")
+
     async def h_backup(self,r):
         if not self.check_auth(r): return web.Response(status=403)
         b=io.BytesIO()
