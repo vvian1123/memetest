@@ -398,40 +398,51 @@
         }
         async function openSettings() {
             try {
-                const c = await (await fetch(`/get_config?token=${token}`)).json();
+                const res = await fetch(`/get_config?token=${token}`);
+                const c = await res.json();
                 const keys = ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
-                              'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token',
-                              'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
+                             'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token',
+                             'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
                 keys.forEach(k => {
                     const el = document.getElementById(`conf_${k}`);
-                    if(el) el.value = c[k] ?? ""; // 修正了这里的逻辑
+                    if(el) {
+                        // 强制过滤掉任何形式的 "None" 字符串
+                        let val = c[k];
+                        if (val === null || val === undefined || String(val).toLowerCase() === "none") {
+                            val = "";
+                        }
+                        el.value = val;
+                    }
                 });
                 document.getElementById('conf_ai_prompt').value = c['ai_prompt'] || "";
                 document.getElementById('settingsModal').style.display = 'flex';
             } catch(e) { showToast('加载配置失败'); }
         }
-       
+
         async function saveSettings() {
             const conf = {};
             const keys = ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
                           'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 
                           'quiet_end', 'web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
-           keys.forEach(k => {
-               const el = document.getElementById(`conf_${k}`);
-               if(el) conf[k] = (k === 'web_token' || k === 'ai_prompt') ? el.value : parseFloat(el.value);
-           });
+            
+            keys.forEach(k => {
+                const el = document.getElementById(`conf_${k}`);
+                if(el) {
+                    const val = el.value.trim();
+                    if (['web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'].includes(k)) {
+                        conf[k] = val;
+                    } else {
+                        // 数字字段：如果是空字符串就不传，或者传 0
+                        conf[k] = val === "" ? 0 : parseFloat(val);
+                    }
+                }
+            });
             conf['ai_prompt'] = document.getElementById('conf_ai_prompt').value;
             
-            const newToken = conf['web_token'];
-            const oldToken = new URLSearchParams(window.location.search).get('token');
-            await fetch(`/update_config?token=${oldToken}`, {method:'POST', body:JSON.stringify(conf)});
-            
-            showToast('配置已保存');
-            if(newToken !== oldToken) {
-                alert('Token 已更改，请使用新链接访问！');
-                window.location.href = `/?token=${newToken}`;
-            } else {
-                closeSettings();
+            const res = await fetch(`/update_config?token=${token}`, {method:'POST', body:JSON.stringify(conf)});
+            if(res.ok) {
+                showToast('配置已保存');
+                setTimeout(() => location.reload(), 500);
             }
         }
         
