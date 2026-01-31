@@ -172,6 +172,69 @@ class MemeMaster(Star):
             print(f"❌ [Meme] 数据迁移失败: {e}", flush=True)
             return False, str(e)
 
+    # === 替换原来的 get_db_context ===
+    def get_db_context(self, current_query=""):
+        """
+        全能读取器：
+        1. 必读：核心规则 (Sticky)
+        2. 联想：根据你现在说的话，去搜相关的旧片段 (Fragment)
+        3. 补全：最近的对话流水 (Dialogue)
+        """
+        try:
+            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            
+            # 1. 取出核心规则 (永远置顶)
+            c.execute("SELECT content FROM memories WHERE type='sticky' ORDER BY importance DESC")
+            stickies = [row['content'] for row in c.fetchall()]
+            
+            # 2. 联想召回 (搜关键词 + 搜内容)
+            related_memories = []
+            if current_query:
+                # 简单分词：去掉“我你他”这种无效词
+                query_words = [w for w in current_query if w not in "我你他的是了很吗？?"]
+                if query_words:
+                    conditions = []
+                    params = []
+                    for w in query_words:
+                        if len(w) >= 1:
+                            # 既搜关键词，也搜内容 (这样那一大坨旧记忆也能被搜到！)
+                            conditions.append("(keywords LIKE ? OR content LIKE ?)")
+                            params.extend([f"%{w}%", f"%{w}%"])
+                    
+                    if conditions:
+                        # 限制只找最相关的 3 条
+                        sql = f"SELECT content FROM memories WHERE type='fragment' AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 3"
+                        c.execute(sql, tuple(params))
+                        related_memories = [row['content'] for row in c.fetchall()]
+
+            # 3. 兜底：如果没联想到，就拿最近生成的 2 条碎片看看
+            c.execute("SELECT content FROM memories WHERE type='fragment' ORDER BY created_at DESC LIMIT 2")
+            recent_memories = [row['content'] for row in c.fetchall()]
+            
+            # 4. 关键：取出最近 15 条对话 (填补短期记忆空白)
+            c.execute("SELECT content FROM memories WHERE type='dialogue' ORDER BY created_at DESC LIMIT 15")
+            dialogues = [row['content'] for row in c.fetchall()][::-1] # 反转回正序
+
+            conn.close()
+            
+            # 去重合并
+            final_fragments = list(set(related_memories + recent_memories))
+
+            context_list = []
+            if stickies: 
+                context_list.append("【绝对规则/核心设定】\n" + "\n".join(stickies))
+            if final_fragments: 
+                context_list.append("【相关回忆/背景】\n" + "\n".join(final_fragments))
+            if dialogues: 
+                context_list.append("【最近的对话】\n" + "\n".join(dialogues))
+                
+            return "\n\n".join(context_list).strip()
+        except Exception as e:
+            print(f"❌ 读取记忆出错: {e}")
+            return ""
+
     def __del__(self):
         self.running = False 
 
@@ -299,14 +362,19 @@ class MemeMaster(Star):
             time_info = self.get_full_time_str()
             system_context = [f"Time: {time_info}"]
             
-            # ★★★ 核心修复2：记忆注入频率判断 ★★★
+            # === [新记忆调用逻辑] ===
+            # 获取注入间隔（默认20条消息触发一次深度记忆注入，防止Prompt过长）
             mem_interval = int(self.local_config.get("memory_interval", 20))
             injected_mem = False
             
-            # 只有当：有记忆 AND (是第1条消息 OR 消息计数能被间隔整除) 时，才注入
-            if self.current_summary and mem_interval > 0:
-                if self.msg_count == 1 or (self.msg_count % mem_interval == 0):
-                    system_context.append(f"Long-term Memory: {self.current_summary}")
+            # 只有满足间隔条件，或者这是第一条消息时，才去翻数据库
+            if mem_interval > 0 and (self.msg_count == 1 or self.msg_count % mem_interval == 0):
+                # 调用你刚才加的“全能读取器”，把当前用户说的话 (msg_str) 传进去联想
+                db_mem = self.get_db_context(msg_str) 
+                
+                if db_mem:
+                    # 这里的标签可以起得正式一点，告诉 AI 这是它的记忆系统
+                    system_context.append(f"Internal Memory System:\n{db_mem}")
                     injected_mem = True
 
             hints = []
@@ -468,49 +536,80 @@ class MemeMaster(Star):
                     self.local_config = self.load_config()
             except: pass
 
-    async def check_and_summarize(self):
+  async def check_and_summarize(self):
+        """自动消化系统 v3.0 (最终版)：生成记忆 + 关键词 + 自动提取核心规则(Sticky)"""
         threshold = self.local_config.get("summary_threshold", 40)
         if len(self.chat_history_buffer) < threshold: return
         
         self.is_summarizing = True 
         try:
-            print(f"⚠️ [Meme] 触发记忆总结...", flush=True)
-            
-            # ★★★ 修复点：先把时间存进变量，后面大家都能用 ★★★
+            print(f"🧠 [Meme] 正在深度思考中...", flush=True)
             now_str = self.get_full_time_str()
+            history_text = "\n".join(self.chat_history_buffer)
             
-            batch = list(self.chat_history_buffer)
             provider = self.context.get_using_provider()
             if not provider: return
             
-            history_text = "\n".join(batch)
+            # === Prompt 升级：教它区分“普通记忆”和“核心规则” ===
+            prompt = f"""
+            Task: Analyze the conversation for Long-term Memory.
+            Current Time: {now_str}
             
-            # 这里用了变量 now_str
-            prompt = f"""当前时间：{now_str}
-                这是一段过去的对话记录。请将其总结为一段简练的“长期记忆”或“日记”。
-                重点记录：用户的喜好、发生的重要事件、双方约定的事情。
-                忽略：无意义的寒暄、重复的表情包指令。
-                字数限制：200字以内。
-                对话内容：
-                {history_text}"""
+            Output a JSON object with 3 fields:
+            1. "summary" (Required): A concise summary of the conversation flow (under 200 words).
+            2. "keywords" (Required): Comma-separated keywords for search.
+            3. "sticky_content" (Optional): 
+               - ONLY if the user explicitly defined a PERMANENT RULE, STRONG PREFERENCE, or IMPORTANT FACT (e.g., "Call me Baby", "My birthday is 5/20", "Never eat spicy food").
+               - If found, extract it as a short, absolute statement.
+               - If nothing critical found, leave this field empty string "".
+            
+            Conversation:
+            {history_text}
+            """
             
             resp = await provider.text_chat(prompt, session_id=None)
-            summary = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
-            summary = self.clean_markdown(summary)
+            raw_text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
             
+            import json
+            summary, keywords, sticky = "", "", ""
+            try:
+                clean_json = raw_text.replace("```json", "").replace("```", "").strip()
+                data = json.loads(clean_json)
+                summary = f"[{now_str}] {data.get('summary', '')}"
+                keywords = data.get('keywords', '')
+                sticky = data.get('sticky_content', '').strip()
+            except:
+                summary = f"[{now_str}] {raw_text}" # 兜底
+                keywords = "history"
+
+            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+            c = conn.cursor()
+            
+            # 1. 存入普通碎片 (Fragment) - 权重 5
             if summary:
-                def write():
-                    with open(self.memory_file, "a", encoding="utf-8") as f: 
-                        # 这里也不会报错了，因为它能找到 now_str 了
-                        f.write(f"\n\n--- {now_str} ---\n{summary}")
-                        
-                await asyncio.get_running_loop().run_in_executor(self.executor, write)
-                self.current_summary = self.load_memory()
-                self.chat_history_buffer = self.chat_history_buffer[len(batch):]
-                self.save_buffer_to_disk()
-                print(f"✅ [Meme] 总结完成", flush=True)
+                c.execute('''INSERT INTO memories (content, type, keywords, importance, created_at) 
+                             VALUES (?, 'fragment', ?, 5, ?)''', 
+                          (summary, keywords, time.time()))
+            
+            # 2. 存入核心规则 (Sticky) - 权重 10 (如果 AI 觉得有必要)
+            if sticky:
+                # 稍微做个去重，防止它重复添加一样的小纸条
+                c.execute("SELECT id FROM memories WHERE type='sticky' AND content=?", (sticky,))
+                if not c.fetchone():
+                    c.execute('''INSERT INTO memories (content, type, importance, created_at) 
+                                 VALUES (?, 'sticky', 10, ?)''', 
+                              (sticky, time.time()))
+                    print(f"📌 [Meme] AI 自动提取了核心规则: {sticky}", flush=True)
+
+            conn.commit()
+            conn.close()
+            
+            self.chat_history_buffer = [] 
+            self.save_buffer_to_disk()
+            print(f"✨ [Meme] 记忆消化完成 (Tags: {keywords})", flush=True)
+
         except Exception as e:
-            print(f"❌ [Meme] 总结失败: {e}", flush=True)
+            print(f"❌ [Meme] 消化失败: {e}", flush=True)
         finally:
             self.is_summarizing = False
 
