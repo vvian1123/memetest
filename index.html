@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MemeMaster 脑部CT扫描</title>
+    <style>
+        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
+        .box { border: 1px solid #333; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+        h3 { color: #fff; border-bottom: 1px solid #555; padding-bottom: 5px; }
+        .item { margin-bottom: 5px; color: #ccc; }
+        .highlight { color: #ff0; font-weight: bold; }
+        button { background: #333; color: #fff; border: 1px solid #fff; padding: 10px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>🧠 AI 脑部实时监控 (Debug Mode)</h1>
+    <button onclick="load()">🔄 刷新数据</button>
+    <span id="status">连接中...</span>
+
+    <div class="box">
+        <h3>📌 小纸条 (Sticky Notes) - 绝对规则</h3>
+        <div id="sticky"></div>
+    </div>
+
+    <div class="box">
+        <h3>🧩 最新记忆碎片 (Fragments) - RAG检索池</h3>
+        <div id="frags"></div>
+    </div>
+
+    <div class="box">
+        <h3>🖼️ 表情包索引 (Memes) - 视觉库</h3>
+        <div>总数: <span id="meme_count" class="highlight">0</span></div>
+        <div>最新入库: <span id="last_meme"></span></div>
+    </div>
+
+    <div class="box">
+        <h3>⚙️ 系统配置</h3>
+        <pre id="config"></pre>
+    </div>
+
+    <script>
+        const token = new URLSearchParams(location.search).get("token");
+
+        async function load() {
+            document.getElementById('status').innerText = '正在读取...';
+            try {
+                let r = await fetch(`/api/get_data?token=${token}`);
+                if(r.status !== 200) throw new Error("Token错误");
+                let data = await r.json();
+
+                // 渲染小纸条
+                document.getElementById('sticky').innerHTML = data.sticky.length 
+                    ? data.sticky.map(s => `<div class="item">📌 ${s}</div>`).join('') 
+                    : '<div style="color:#666">空空如也</div>';
+
+                // 渲染最新5条记忆
+                let lastFrags = data.frags.slice(-5).reverse();
+                document.getElementById('frags').innerHTML = lastFrags.length
+                    ? lastFrags.map(f => `<div class="item">[${f.time}] <span class="highlight">${f.content}</span> <br>Key: ${f.keywords}</div>`).join('')
+                    : '<div style="color:#666">还没开始聊天</div>';
+
+                // 渲染表情数据
+                let keys = Object.keys(data.memes);
+                document.getElementById('meme_count').innerText = keys.length;
+                if(keys.length > 0) {
+                    let lastKey = keys[keys.length-1];
+                    let lastVal = data.memes[lastKey];
+                    document.getElementById('last_meme').innerText = `${lastVal.tags} (${lastVal.source})`;
+                }
+
+                // 渲染配置
+                document.getElementById('config').innerText = JSON.stringify(data.config, null, 2);
+                document.getElementById('status').innerText = '✅ 数据已同步';
+            } catch(e) {
+                document.getElementById('status').innerText = '❌ 连接失败: ' + e;
+            }
+        }
+        load();
+    </script>
+</body>
+</html>
