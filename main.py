@@ -562,8 +562,8 @@ class MemeMaster(Star):
                     print(f"🔄 [Meme] 配置文件热重载", flush=True)
                     self.local_config = self.load_config()
             except: pass
-
-  async def check_and_summarize(self):
+            
+    async def check_and_summarize(self):
         """自动消化系统 v3.0：确保总结成功才删除缓存，失败则持续累积"""
         threshold = self.local_config.get("summary_threshold", 40)
         # 如果还没到条数，或者正在总结中，就不动
