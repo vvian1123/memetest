@@ -399,40 +399,42 @@
         async function openSettings() {
             try {
                 const c = await (await fetch(`/get_config?token=${token}`)).json();
-                ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
-                 'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token']
-                .forEach(k => { ... });
-                    if(document.getElementById(`conf_${k}`)) document.getElementById(`conf_${k}`).value = c[k]??0;
+                const keys = ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
+                              'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token',
+                              'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
+                keys.forEach(k => {
+                    const el = document.getElementById(`conf_${k}`);
+                    if(el) el.value = c[k] ?? ""; // 修正了这里的逻辑
                 });
                 document.getElementById('conf_ai_prompt').value = c['ai_prompt'] || "";
                 document.getElementById('settingsModal').style.display = 'flex';
             } catch(e) { showToast('加载配置失败'); }
         }
-        function closeSettings() { document.getElementById('settingsModal').style.display = 'none'; }
-       async function saveSettings() {
-           const conf = {};
-           const keys = ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
-                         'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 
-                         'quiet_end', 'web_token''smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
+        
+        async function saveSettings() {
+            const conf = {};
+            const keys = ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
+                          'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 
+                          'quiet_end', 'web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
            keys.forEach(k => {
                const el = document.getElementById(`conf_${k}`);
                if(el) conf[k] = (k === 'web_token' || k === 'ai_prompt') ? el.value : parseFloat(el.value);
            });
-           conf['ai_prompt'] = document.getElementById('conf_ai_prompt').value;
-           
-           const newToken = conf['web_token'];
-           const oldToken = new URLSearchParams(window.location.search).get('token');
-           
-           await fetch(`/update_config?token=${oldToken}`, {method:'POST', body:JSON.stringify(conf)});
-           
-           showToast('配置已保存');
-           if(newToken !== oldToken) {
-               alert('Token 已更改，请使用新链接访问！');
-               window.location.href = `/?token=${newToken}`;
-           } else {
-               closeSettings();
-           }
-       }
+            conf['ai_prompt'] = document.getElementById('conf_ai_prompt').value;
+            
+            const newToken = conf['web_token'];
+            const oldToken = new URLSearchParams(window.location.search).get('token');
+            await fetch(`/update_config?token=${oldToken}`, {method:'POST', body:JSON.stringify(conf)});
+            
+            showToast('配置已保存');
+            if(newToken !== oldToken) {
+                alert('Token 已更改，请使用新链接访问！');
+                window.location.href = `/?token=${newToken}`;
+            } else {
+                closeSettings();
+            }
+        }
+        
         async function slimImages() {
             if(!confirm('⚡ 瘦身操作会压缩所有图片，确定吗？')) return;
             showToast('正在处理...');
