@@ -1,3 +1,25 @@
+import subprocess
+import sys
+import importlib
+
+DEPENDENCIES = ["jieba", "lunar_python", "Pillow"]
+
+def install_dependencies():
+    for pkg in DEPENDENCIES:
+        import_name = pkg.replace("-", "_")
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            print(f"检测到缺少依赖 {pkg}，正在尝试自动安装...", flush=True)
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                print(f"依赖 {pkg} 安装成功！", flush=True)
+            except Exception as e:
+                print(f"依赖 {pkg} 安装失败: {e}", flush=True)
+
+install_dependencies()
+
+import jieba
 import os
 import json
 import random
@@ -7,8 +29,11 @@ import re
 import aiohttp
 import difflib
 import zipfile
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 import sqlite3
-import jieba
 import io
 import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -28,7 +53,7 @@ from astrbot.core.message.components import Image, Plain
 
 print(">>> [Meme] 插件主文件 v23 (Logic Perfected) 已被系统加载 <<<", flush=True)
 
-@register("vv_meme_master", "Vvivloy", "防抖/图库/记忆/思考链/静默模式", "2.0.0")
+@register("vv_meme_master", "Vvivloy", "防抖/图库/记忆", "3.0.0")
 class MemeMaster(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -804,35 +829,6 @@ class MemeMaster(Star):
         for c in e.message_obj.message:
             if isinstance(c, Image): urls.append(c.url)
         return urls
-    
-    def smart_split(self, chain):
-        segs = []; buf = []
-        def flush(): 
-            if buf: segs.append(buf[:]); buf.clear()
-        
-        for c in chain:
-            if isinstance(c, Image): flush(); segs.append([c]); continue
-            if isinstance(c, Plain):
-                txt = c.text; idx = 0; chunk = ""; stack = []
-                while idx < len(txt):
-                    char = txt[idx]
-                    if char in self.pair_map: stack.append(char)
-                    elif stack and char == self.pair_map[stack[-1]]: stack.pop()
-                    
-                    is_split_char = char in self.split_chars
-                    force_split = (len(chunk) > 80)
-                    
-                    if (not stack and is_split_char) or force_split:
-                        chunk += char
-                        if is_split_char:
-                            while idx + 1 < len(txt) and txt[idx+1] in self.split_chars: 
-                                idx += 1; chunk += txt[idx]
-                        if chunk.strip(): buf.append(Plain(chunk))
-                        flush(); chunk = ""
-                    else: chunk += char
-                    idx += 1
-                if chunk: buf.append(Plain(chunk))
-        flush(); return segs
 
     def find_best_match(self, query):
         best, score = None, 0
@@ -885,6 +881,7 @@ class MemeMaster(Star):
         app.router.add_get("/backup", self.h_backup)
         app.router.add_post("/restore", self.h_restore)
         app.router.add_post("/slim_images", self.h_slim)
+        app.router.add_post("/test_email", self.h_test_email)
         app.router.add_post("/import_legacy", self.h_import_legacy) # <--- 新加的
         app.router.add_get("/get_stickies", self.h_get_stickies) # <--- 新加
         app.router.add_post("/update_sticky", self.h_update_sticky) # <--- 新加
@@ -1067,3 +1064,47 @@ class MemeMaster(Star):
                     count += 1
             except: pass
         return web.Response(text=f"优化了 {count} 张")
+        async def h_test_email(self, r):
+        if not self.check_auth(r): return web.Response(status=403)
+        res = await self.send_backup_email()
+        return web.Response(text=res)
+
+    async def send_backup_email(self):
+        conf = self.local_config
+        host = conf.get("smtp_host")
+        user = conf.get("smtp_user")
+        pw = conf.get("smtp_pass")
+        to_email = conf.get("email_to")
+        
+        if not all([host, user, pw, to_email]): return "配置不全：请检查SMTP主机、账号、授权码和收件人"
+
+        try:
+            # 创建内存中的压缩包（不包含图片，只包含核心数据库和配置，防止邮件太大）
+            zip_data = io.BytesIO()
+            with zipfile.ZipFile(zip_data, 'w', zipfile.ZIP_DEFLATED) as z:
+                db_path = os.path.join(self.base_dir, "meme_core.db")
+                if os.path.exists(db_path): z.write(db_path, "meme_core.db")
+                if os.path.exists(self.data_file): z.write(self.data_file, "memes.json")
+                if os.path.exists(self.config_file): z.write(self.config_file, "config.json")
+            
+            msg = MIMEMultipart()
+            msg['Subject'] = f"MemeMaster 备份 - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            msg['From'] = user
+            msg['To'] = to_email
+            
+            part = MIMEBase('application', "octet-stream")
+            part.set_payload(zip_data.getvalue())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', 'attachment; filename="meme_core_backup.zip"')
+            msg.attach(part)
+            
+            def _send():
+                # 使用 SSL 连接 SMTP
+                with smtplib.SMTP_SSL(host, 465) as server:
+                    server.login(user, pw)
+                    server.send_message(msg)
+            
+            await asyncio.get_running_loop().run_in_executor(self.executor, _send)
+            return "✅ 备份邮件已发送，请查收"
+        except Exception as e:
+            return f"❌ 发送失败: {str(e)}"
