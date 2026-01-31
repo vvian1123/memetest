@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>Lioren's Memory Core</title>
+    <title>MemeMaster Pro Ultimate</title>
     <style>
         :root { 
             --primary: #6366f1; 
@@ -138,9 +138,10 @@
     <div class="header">
         <div class="brand">
             <div class="logo-icon">🤍</div>
-            <h1>Lioren's Core</h1>
+            <h1>Mememaster Pro</h1>
         </div>
         <div class="header-icons">
+            <div class="icon-btn" onclick="document.getElementById('restoreInput').click()" title="恢复"><span style="font-size:1.1rem">📥</span></div>
             <div class="icon-btn" onclick="backupData()" title="备份"><span style="font-size:1.1rem">📤</span></div>
             <div class="icon-btn" onclick="openSettings()" title="配置"><span style="font-size:1.1rem; color:#64748b;">⚙️</span></div>
             <div class="icon-btn" style="background:#f3e8ff; color:#a855f7" onclick="openUploadModal()" title="上传"><span style="font-size:1.2rem">💟</span></div>
@@ -192,6 +193,14 @@
         </div>
     </div>
 
+    <div class="modal-overlay" id="restoreModal">
+        <div class="modal" style="text-align:center; padding:40px;">
+            <div style="font-size:3rem; margin-bottom:15px;">📥</div>
+            <h3 style="margin:0;">正在恢复</h3>
+            <p style="color:#64748b; font-size:0.9rem;">请勿关闭页面...</p>
+        </div>
+    </div>
+
     <div class="modal-overlay" id="editModal">
         <div class="modal">
             <h3 style="margin-top:0;">✏️ 修改标签</h3>
@@ -203,13 +212,13 @@
         </div>
     </div>
     
-    <div class="modal-overlay" id="settingsModal">
+   <div class="modal-overlay" id="settingsModal">
         <div class="modal">
             <h3 style="margin:0 0 20px 0;">配置中心</h3>
+            
             <div class="tabs">
                 <div class="tab active" onclick="switchTab('tab-meme', this)">图库</div>
-                <div class="tab" onclick="switchTab('tab-memory', this)">🧠 记忆</div>
-                <div class="tab" onclick="switchTab('tab-logic', this)">逻辑</div>
+                <div class="tab" onclick="switchTab('tab-memory', this)">🧠 记忆</div> <div class="tab" onclick="switchTab('tab-logic', this)">逻辑</div>
             </div>
 
             <div id="tab-meme" class="tab-content active">
@@ -222,17 +231,17 @@
                 <button class="btn-primary" style="background:#fff7ed; color:#d97706;" onclick="slimImages()">⚡ 一键瘦身</button>
                 
                 <div style="margin-top:20px; border-top:1px dashed #e2e8f0; padding-top:15px;">
-                    <h4 style="margin:0 0 10px 0; font-size:0.9rem; color:#64748b;">📦 数据迁移 (导入 JSON/TXT)</h4>
-                    <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:10px;">支持上传 memes.json, memory.txt, buffer.json</div>
+                    <h4 style="margin:0 0 10px 0; font-size:0.9rem; color:#64748b;">📦 旧数据迁移</h4>
+                    <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:10px;">上传旧版 memes.json / memory.txt / buffer.json</div>
                     <input type="file" id="legacyInput" multiple style="display:none" onchange="handleLegacyImport()">
-                    <button class="btn-primary" style="background:#f0f9ff; color:#0369a1;" onclick="document.getElementById('legacyInput').click()">📥 选择备份文件导入</button>
+                    <button class="btn-primary" style="background:#f0f9ff; color:#0369a1;" onclick="document.getElementById('legacyInput').click()">📥 导入旧备份文件</button>
                 </div>
             </div>
 
             <div id="tab-memory" class="tab-content">
                 <div style="background:#fffbeb; padding:15px; border-radius:16px; margin-bottom:20px; color:#92400e; font-size:0.9rem;">
                     📌 <strong>核心记忆 (Sticky Notes)</strong><br>
-                    最高优先级注入，Lioren 绝不会忘。<br>适合记录：纪念日、喜好、雷点、生理周期等。
+                    最高优先级注入。适合记录：纪念日、喜好、雷点、生理周期等。
                 </div>
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
                     <input type="text" id="newStickyInput" placeholder="例如: 纪念日是5月20日" 
@@ -272,6 +281,7 @@
             </div>
         </div>
     </div>
+    
 
     <script>
         const rawData = {{MEME_DATA}}; 
@@ -356,7 +366,23 @@
         }
 
         function backupData() { window.location.href = `/backup?token=${token}`; showToast('📦 正在打包...'); }
+        function handleRestoreFile() {
+            const f = document.getElementById('restoreInput').files[0];
+            if(!f) return;
+            if(!confirm('⚠️ 恢复将覆盖现有数据，确定吗？')) return;
+            document.getElementById('restoreModal').style.display = 'flex';
+            const fd = new FormData(); fd.append('file', f);
+            fetch(`/restore?token=${token}`, {method:'POST', body:fd})
+            .then(r => {
+                if(r.ok) { alert('✅ 恢复成功！'); location.reload(); }
+                else alert('❌ 失败');
+            }).catch(()=>alert('❌ 网络错误')).finally(()=>document.getElementById('restoreModal').style.display = 'none');
+        }
 
+        function switchTab(id, el) {
+            document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); el.classList.add('active');
+            document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active')); document.getElementById(id).classList.add('active');
+        }
         async function openSettings() {
             try {
                 const c = await (await fetch(`/get_config?token=${token}`)).json();
@@ -367,9 +393,6 @@
                 });
                 document.getElementById('conf_ai_prompt').value = c['ai_prompt'] || "";
                 document.getElementById('settingsModal').style.display = 'flex';
-                
-                // 默认切到图库 Tab
-                switchTab('tab-meme', document.querySelector('.tab.active'));
             } catch(e) { showToast('加载配置失败'); }
         }
         function closeSettings() { document.getElementById('settingsModal').style.display = 'none'; }
@@ -409,77 +432,71 @@
             await fetch(`/batch_delete?token=${token}`, {method:'POST', body:JSON.stringify({filenames:Array.from(state.selected)})});
             state.selected.forEach(fn => delete rawData[fn]); exitSelectMode(); process(); render(); showToast('删除成功');
         }
-
         // === 新增：记忆管理 JS ===
-        async function loadStickies() {
-            const list = document.getElementById('stickyList');
-            list.innerHTML = '<div style="text-align:center; color:#94a3b8;">加载中... 🧠</div>';
-            try {
-                const res = await fetch(`/get_stickies?token=${token}`);
-                const data = await res.json();
-                list.innerHTML = '';
-                if(data.length === 0) {
-                    list.innerHTML = '<div style="text-align:center; color:#cbd5e1; padding:20px;">暂无核心记忆</div>';
-                    return;
-                }
-                data.forEach(item => {
-                    const div = document.createElement('div');
-                    div.style.cssText = "background:white; padding:12px; border-radius:12px; border:1px solid #f1f5f9; display:flex; align-items:center;";
-                    div.innerHTML = `
-                        <div contenteditable="true" onblur="editSticky(${item.id}, this)" style="flex:1; outline:none; margin-right:10px; color:#334155;">${item.content}</div>
-                        <button onclick="delSticky(${item.id})" style="border:none; background:none; cursor:pointer; opacity:0.5;">🗑️</button>
-                    `;
-                    list.appendChild(div);
-                });
-            } catch(e) { list.innerHTML = '加载失败'; }
-        }
-
-        async function addSticky() {
-            const val = document.getElementById('newStickyInput').value.trim();
-            if(!val) return;
-            await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'add', content:val})});
-            document.getElementById('newStickyInput').value = ''; loadStickies();
-        }
-        async function delSticky(id) {
-            if(confirm('🗑️ 确定删除吗？')) {
-                await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'delete', id:id})});
-                loadStickies();
+    async function loadStickies() {
+        const list = document.getElementById('stickyList');
+        list.innerHTML = '<div style="text-align:center; color:#94a3b8;">加载中... 🧠</div>';
+        try {
+            const res = await fetch(`/get_stickies?token=${token}`);
+            const data = await res.json();
+            list.innerHTML = '';
+            if(data.length === 0) {
+                list.innerHTML = '<div style="text-align:center; color:#cbd5e1; padding:20px;">暂无核心记忆</div>';
+                return;
             }
-        }
-        async function editSticky(id, el) {
-            await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'edit', id:id, content:el.innerText})});
-            showToast('已更新');
-        }
-        
-        // === 新增：旧数据导入 JS ===
-        async function handleLegacyImport() {
-            const files = document.getElementById('legacyInput').files;
-            if(!files.length) return;
-            const fd = new FormData();
-            for(let f of files) {
-                if(f.name.includes('meme')) fd.append('memes_json', f);
-                else if(f.name.includes('memory')) fd.append('memory_txt', f);
-                else if(f.name.includes('buffer')) fd.append('buffer_json', f);
-            }
-            showToast('正在导入...');
-            try {
-                const res = await (await fetch(`/import_legacy?token=${token}`, {method:'POST', body:fd})).text();
-                alert(res);
-                location.reload();
-            } catch(e) { alert('导入失败'); }
-        }
+            data.forEach(item => {
+                const div = document.createElement('div');
+                div.style.cssText = "background:white; padding:12px; border-radius:12px; border:1px solid #f1f5f9; display:flex; align-items:center;";
+                div.innerHTML = `
+                    <div contenteditable="true" onblur="editSticky(${item.id}, this)" style="flex:1; outline:none; margin-right:10px; color:#334155;">${item.content}</div>
+                    <button onclick="delSticky(${item.id})" style="border:none; background:none; cursor:pointer; opacity:0.5;">🗑️</button>
+                `;
+                list.appendChild(div);
+            });
+        } catch(e) { list.innerHTML = '加载失败'; }
+    }
 
-        // 切换 Tab 的逻辑
-        function switchTab(id, el) {
-            document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); 
-            if(el) el.classList.add('active');
-            
-            document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active')); 
-            document.getElementById(id).classList.add('active');
-
-            if(id === 'tab-memory') loadStickies();
+    async function addSticky() {
+        const val = document.getElementById('newStickyInput').value.trim();
+        if(!val) return;
+        await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'add', content:val})});
+        document.getElementById('newStickyInput').value = ''; loadStickies();
+    }
+    async function delSticky(id) {
+        if(confirm('🗑️ 确定删除吗？')) {
+            await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'delete', id:id})});
+            loadStickies();
         }
+    }
+    async function editSticky(id, el) {
+        await fetch(`/update_sticky?token=${token}`, {method:'POST', body:JSON.stringify({action:'edit', id:id, content:el.innerText})});
+        showToast('已更新');
+    }
+    
+    // === 新增：旧数据导入 JS ===
+    async function handleLegacyImport() {
+        const files = document.getElementById('legacyInput').files;
+        if(!files.length) return;
+        const fd = new FormData();
+        for(let f of files) {
+            if(f.name.includes('meme')) fd.append('memes_json', f);
+            else if(f.name.includes('memory')) fd.append('memory_txt', f);
+            else if(f.name.includes('buffer')) fd.append('buffer_json', f);
+        }
+        showToast('正在导入...');
+        try {
+            const res = await (await fetch(`/import_legacy?token=${token}`, {method:'POST', body:fd})).text();
+            alert(res);
+            location.reload();
+        } catch(e) { alert('导入失败'); }
+    }
 
+    // === 修改切换 Tab 的逻辑 ===
+    const _oldSwitch = switchTab;
+    switchTab = function(id, el) {
+        _oldSwitch(id, el);
+        if(id === 'tab-memory') loadStickies();
+    }
         init();
     </script>
 </body>
