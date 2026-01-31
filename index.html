@@ -279,6 +279,13 @@
                     <div class="form-group"><label>静默开始</label><input type="number" id="conf_quiet_start"></div>
                     <div class="form-group"><label>静默结束</label><input type="number" id="conf_quiet_end"></div>
                 </div>
+                <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
+                <h4 style="margin:0 0 10px 0; font-size:0.9rem; color:#64748b;">📧 邮件自动备份 (不含图片)</h4>
+                <div class="form-group"><label>SMTP服务器 (如 smtp.qq.com)</label><input type="text" id="conf_smtp_host" placeholder="smtp.qq.com"></div>
+                <div class="form-group"><label>邮箱账号</label><input type="text" id="conf_smtp_user" placeholder="example@qq.com"></div>
+                <div class="form-group"><label>授权码 (非密码)</label><input type="password" id="conf_smtp_pass"></div>
+                <div class="form-group"><label>收件邮箱</label><input type="text" id="conf_email_to"></div>
+                <button class="btn-primary" style="background:#f0fdf4; color:#16a34a; border:1px solid #bbf7d0;" onclick="testEmail()">📧 发送测试备份</button>
             </div>
 
             <div style="display:flex; justify-content:space-between; margin-top:25px;">
@@ -405,7 +412,8 @@
        async function saveSettings() {
            const conf = {};
            const keys = ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
-                 'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token'];
+                         'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 
+                         'quiet_end', 'web_token''smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
            keys.forEach(k => {
                const el = document.getElementById(`conf_${k}`);
                if(el) conf[k] = (k === 'web_token' || k === 'ai_prompt') ? el.value : parseFloat(el.value);
@@ -514,6 +522,14 @@
     switchTab = function(id, el) {
         _oldSwitch(id, el);
         if(id === 'tab-memory') loadStickies();
+    }
+
+    async function testEmail() {
+        showToast('正在尝试发送邮件...');
+        try {
+            const res = await (await fetch(`/test_email?token=${token}`, {method:'POST'})).text();
+            alert(res);
+        } catch(e) { alert('请求失败'); }
     }
         init();
     </script>
