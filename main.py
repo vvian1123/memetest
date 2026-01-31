@@ -922,8 +922,6 @@ class MemeMaster(Star):
         if not self.check_auth(r): return web.Response(status=403)
         d=await r.json(); self.data[d['filename']]['tags']=d['tags']; self.save_data(); return web.Response(text="ok")
     async def h_gcf(self,r): return web.json_response(self.local_config)
-    async def h_gcf(self,r): 
-        return web.json_response(self.local_config)
 
     async def h_ucf(self, r):
         if not self.check_auth(r): return web.Response(status=403)
