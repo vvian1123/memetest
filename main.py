@@ -564,20 +564,23 @@ class MemeMaster(Star):
             except: pass
 
   async def check_and_summarize(self):
-        """自动消化系统 v3.0 (最终版)：生成记忆 + 关键词 + 自动提取核心规则(Sticky)"""
+        """自动消化系统 v3.0：确保总结成功才删除缓存，失败则持续累积"""
         threshold = self.local_config.get("summary_threshold", 40)
-        if len(self.chat_history_buffer) < threshold: return
+        # 如果还没到条数，或者正在总结中，就不动
+        if len(self.chat_history_buffer) < threshold or self.is_summarizing: 
+            return
         
         self.is_summarizing = True 
         try:
-            print(f"🧠 [Meme] 正在深度思考中...", flush=True)
+            print(f"🧠 [Meme] 正在尝试总结记忆 (当前积压: {len(self.chat_history_buffer)} 条)...", flush=True)
             now_str = self.get_full_time_str()
             history_text = "\n".join(self.chat_history_buffer)
             
             provider = self.context.get_using_provider()
-            if not provider: return
+            if not provider: 
+                self.is_summarizing = False
+                return
             
-            # === Prompt 升级：教它区分“普通记忆”和“核心规则” ===
             prompt = f"""
             Task: Analyze the conversation for Long-term Memory.
             Current Time: {now_str}
@@ -597,7 +600,7 @@ class MemeMaster(Star):
             resp = await provider.text_chat(prompt, session_id=None)
             raw_text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
             
-            import json
+            # 解析结果
             summary, keywords, sticky = "", "", ""
             try:
                 clean_json = raw_text.replace("```json", "").replace("```", "").strip()
@@ -606,40 +609,34 @@ class MemeMaster(Star):
                 keywords = data.get('keywords', '')
                 sticky = data.get('sticky_content', '').strip()
             except:
-                summary = f"[{now_str}] {raw_text}" # 兜底
+                # 兜底：如果AI没回JSON，就把全文当总结
+                summary = f"[{now_str}] {raw_text[:200]}"
                 keywords = "history"
 
+            # 写入数据库
             conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
             c = conn.cursor()
-            
-            # 1. 存入普通碎片 (Fragment) - 权重 5
             if summary:
-                c.execute('''INSERT INTO memories (content, type, keywords, importance, created_at) 
-                             VALUES (?, 'fragment', ?, 5, ?)''', 
+                c.execute("INSERT INTO memories (content, type, keywords, importance, created_at) VALUES (?, 'fragment', ?, 5, ?)", 
                           (summary, keywords, time.time()))
-            
-            # 2. 存入核心规则 (Sticky) - 权重 10 (如果 AI 觉得有必要)
             if sticky:
-                # 稍微做个去重，防止它重复添加一样的小纸条
                 c.execute("SELECT id FROM memories WHERE type='sticky' AND content=?", (sticky,))
                 if not c.fetchone():
-                    c.execute('''INSERT INTO memories (content, type, importance, created_at) 
-                                 VALUES (?, 'sticky', 10, ?)''', 
+                    c.execute("INSERT INTO memories (content, type, importance, created_at) VALUES (?, 'sticky', 10, ?)", 
                               (sticky, time.time()))
-                    print(f"📌 [Meme] AI 自动提取了核心规则: {sticky}", flush=True)
-
             conn.commit()
             conn.close()
             
+            # 【关键】只有走到这一步（成功写入DB），才清空 buffer
             self.chat_history_buffer = [] 
             self.save_buffer_to_disk()
-            print(f"✨ [Meme] 记忆消化完成 (Tags: {keywords})", flush=True)
+            print(f"✨ [Meme] 记忆消化完成，已清空缓存。", flush=True)
 
         except Exception as e:
-            print(f"❌ [Meme] 消化失败: {e}", flush=True)
+            print(f"❌ [Meme] 消化失败 (保留缓存待下次重试): {e}", flush=True)
         finally:
             self.is_summarizing = False
-
+            
     async def ai_evaluate_image(self, img_url, context_text=""):
         try:
             img_data = None
@@ -924,18 +921,25 @@ class MemeMaster(Star):
         if not self.check_auth(r): return web.Response(status=403)
         d=await r.json(); self.data[d['filename']]['tags']=d['tags']; self.save_data(); return web.Response(text="ok")
     async def h_gcf(self,r): return web.json_response(self.local_config)
+    async def h_gcf(self,r): 
+        return web.json_response(self.local_config)
+
     async def h_ucf(self, r):
         if not self.check_auth(r): return web.Response(status=403)
-        new_conf = await r.json()
-        for k, v in new_conf.items():
-            if k in ['web_token', 'ai_prompt']:
-                self.local_config[k] = str(v)
-            else:
-                try: self.local_config[k] = float(v)
-                    except: pass
-                        
-        self.save_config()
-        return web.Response(text="ok")
+        try:
+            new_conf = await r.json()
+            for k, v in new_conf.items():
+                if k in ['web_token', 'ai_prompt', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to']:
+                    self.local_config[k] = str(v)
+                else:
+                    try:
+                        self.local_config[k] = float(v)
+                    except:
+                        pass
+            self.save_config()
+            return web.Response(text="ok")
+        except Exception as e:
+            return web.Response(status=500, text=str(e))
 
     async def h_backup(self,r):
         if not self.check_auth(r): return web.Response(status=403)
@@ -945,30 +949,29 @@ class MemeMaster(Star):
                 for f in files: z.write(os.path.join(root,f),f"images/{f}")
             if os.path.exists(self.data_file): z.write(self.data_file,"memes.json")
             if os.path.exists(self.config_file): z.write(self.config_file,"config.json")
-            if os.path.exists(self.memory_file): z.write(self.memory_file, "memory.txt")
             if os.path.exists(self.buffer_file): z.write(self.buffer_file, "buffer.json")
+            db_p = os.path.join(self.base_dir, "meme_core.db")
+            if os.path.exists(db_p): z.write(db_p, "meme_core.db")
         b.seek(0)
         return web.Response(body=b, headers={'Content-Disposition':'attachment; filename="meme_backup.zip"'})
+
     async def h_restore(self, r):
-        if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
+        if not self.check_auth(r): return web.Response(status=403)
         try:
             reader = await r.multipart()
             field = await reader.next()
-            if not field or field.name != 'file': return web.Response(status=400, text="Invalid file")
             file_data = await field.read()
-            if not file_data: return web.Response(status=400, text="Empty file")
             def unzip_action():
-                with zipfile.ZipFile(io.BytesIO(file_data), 'r') as z: z.extractall(self.base_dir)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self.executor, unzip_action)
+                with zipfile.ZipFile(io.BytesIO(file_data), 'r') as z: 
+                    z.extractall(self.base_dir)
+            await asyncio.get_running_loop().run_in_executor(self.executor, unzip_action)
+            # 重新加载数据
             self.data = self.load_data()
             self.local_config = self.load_config()
-            self.current_summary = self.load_memory() 
             self.chat_history_buffer = self.load_buffer_from_disk()
-            asyncio.create_task(self._init_image_hashes())
             return web.Response(text="ok")
         except Exception as e:
-            return web.Response(status=500, text=f"Error: {str(e)}")
+            return web.Response(status=500, text=str(e))
 
     # === 动作1：贴在文件底部的 Web 处理区域 ===
     async def h_import_legacy(self, r):
@@ -1064,7 +1067,8 @@ class MemeMaster(Star):
                     count += 1
             except: pass
         return web.Response(text=f"优化了 {count} 张")
-        async def h_test_email(self, r):
+        
+    async def h_test_email(self, r):
         if not self.check_auth(r): return web.Response(status=403)
         res = await self.send_backup_email()
         return web.Response(text=res)
