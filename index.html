@@ -266,6 +266,12 @@
                         <label>总结阈值 (条数)</label>
                         <input type="number" id="conf_summary_threshold">
                     </div>
+                    <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
+                    <div class="form-group">
+                        <label>管理台访问 Token (修改后需重新登录)</label>
+                        <input type="text" id="conf_web_token" placeholder="当前密码">
+                        <div class="hint">修改此项后，保存成功会自动跳转新链接</div>
+                    </div>
                 </div>
                 <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
                 <div class="form-group"><label>主动聊天 (分)</label><input type="number" id="conf_proactive_interval"></div>
@@ -387,8 +393,8 @@
             try {
                 const c = await (await fetch(`/get_config?token=${token}`)).json();
                 ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
-                 'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end']
-                .forEach(k => {
+                 'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token']
+                .forEach(k => { ... });
                     if(document.getElementById(`conf_${k}`)) document.getElementById(`conf_${k}`).value = c[k]??0;
                 });
                 document.getElementById('conf_ai_prompt').value = c['ai_prompt'] || "";
@@ -396,17 +402,29 @@
             } catch(e) { showToast('加载配置失败'); }
         }
         function closeSettings() { document.getElementById('settingsModal').style.display = 'none'; }
-        async function saveSettings() {
-            const conf = {};
-            ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
-             'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end']
-            .forEach(k => {
-                conf[k] = parseFloat(document.getElementById(`conf_${k}`).value);
-            });
-            conf['ai_prompt'] = document.getElementById('conf_ai_prompt').value;
-            await fetch(`/update_config?token=${token}`, {method:'POST', body:JSON.stringify(conf)});
-            closeSettings(); showToast('配置已保存');
-        }
+       async function saveSettings() {
+           const conf = {};
+           const keys = ['reply_prob','auto_save_cooldown','debounce_time','delay_base','delay_factor', 
+                 'memory_interval', 'summary_threshold', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token'];
+           keys.forEach(k => {
+               const el = document.getElementById(`conf_${k}`);
+               if(el) conf[k] = (k === 'web_token' || k === 'ai_prompt') ? el.value : parseFloat(el.value);
+           });
+           conf['ai_prompt'] = document.getElementById('conf_ai_prompt').value;
+           
+           const newToken = conf['web_token'];
+           const oldToken = new URLSearchParams(window.location.search).get('token');
+           
+           await fetch(`/update_config?token=${oldToken}`, {method:'POST', body:JSON.stringify(conf)});
+           
+           showToast('配置已保存');
+           if(newToken !== oldToken) {
+               alert('Token 已更改，请使用新链接访问！');
+               window.location.href = `/?token=${newToken}`;
+           } else {
+               closeSettings();
+           }
+       }
         async function slimImages() {
             if(!confirm('⚡ 瘦身操作会压缩所有图片，确定吗？')) return;
             showToast('正在处理...');
