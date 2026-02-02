@@ -474,7 +474,7 @@ class MemeMaster(Star):
             traceback.print_exc()
 
 
-   @filter.on_decorating_result(priority=0)
+    @filter.on_decorating_result(priority=0)
     async def on_output(self, event: AstrMessageEvent):
         if getattr(event, "__meme_processed", False): return
         
