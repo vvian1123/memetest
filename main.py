@@ -342,7 +342,7 @@ class MemeMaster(Star):
     # ==========================
     # 主逻辑
     # ==========================
-   async def _master_handler(self, event: AstrMessageEvent):
+    async def _master_handler(self, event: AstrMessageEvent):
         # 1. 基础防爆 & 自检 (保持不变)
         try:
             user_id = str(event.message_obj.sender.user_id)
