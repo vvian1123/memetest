@@ -221,7 +221,7 @@ class MemeMaster(Star):
         # 去重并取前 8 个
         return list(set(candidates))[:8]
     
-    # === 确保这个函数在类里面 ===
+   # === 替换这个函数 ===
     def merge_legacy_data(self, legacy_memes=None, legacy_memory="", legacy_buffer=None):
         """将旧 JSON 数据导入 SQLite"""
         try:
@@ -233,17 +233,16 @@ class MemeMaster(Star):
             if legacy_memes:
                 for fn, info in legacy_memes.items():
                     try:
-                        # 尝试插入，忽略重复
                         c.execute("INSERT OR IGNORE INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, ?, ?, ?)",
                                   (fn, info.get('tags'), info.get('source', 'manual'), info.get('hash', ''), time.time()))
                         count += 1
                     except: pass
             
-            # 2. 导入 memory.txt (作为 Sticky)
+            # 2. 导入 memory.txt
             if legacy_memory and legacy_memory.strip():
                 self.save_message_to_db(legacy_memory, 'sticky')
                 
-            # 3. 导入 buffer.json (作为 Dialogue)
+            # 3. 导入 buffer.json
             if legacy_buffer and isinstance(legacy_buffer, list):
                 for msg in legacy_buffer:
                     self.save_message_to_db(str(msg), 'dialogue')
@@ -251,9 +250,6 @@ class MemeMaster(Star):
             conn.commit()
             conn.close()
             return True, f"成功导入 {count} 张图片记录及相关记忆"
-        except Exception as e:
-            return False, str(e)
-            
         except Exception as e:
             print(f"❌ [Meme] 数据迁移失败: {e}", flush=True)
             return False, str(e)
@@ -721,6 +717,7 @@ class MemeMaster(Star):
         finally:
             self.is_summarizing = False
             
+    # === 替换这个函数 ===
     async def ai_evaluate_image(self, img_url, context_text=""):
         try:
             img_data = None
@@ -728,6 +725,7 @@ class MemeMaster(Star):
                 async with s.get(img_url) as r:
                     if r.status == 200: img_data = await r.read()
             if not img_data: return
+            
             current_hash = await self._calc_hash_async(img_data)
             conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
             c = conn.cursor()
@@ -747,7 +745,6 @@ class MemeMaster(Star):
             
             resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
             content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
-
             
             if "YES" in content:
                 match = re.search(r"<(?P<tag>.*?)>[:：]?(?P<desc>.*)", content)
@@ -766,6 +763,8 @@ class MemeMaster(Star):
                               (fn, full_tag, current_hash, time.time()))
                     conn.commit()
                     conn.close()
+        except Exception as e:
+            print(f"❌ [Meme] 自动识图出错: {e}", flush=True)
 
     async def _lonely_watcher(self):
         while self.running: 
@@ -1141,7 +1140,6 @@ class MemeMaster(Star):
         except Exception as e:
             return web.Response(status=500, text=str(e))
 
-    # === 动作1：贴在文件底部的 Web 处理区域 ===
     async def h_import_legacy(self, r):
         """WebUI 接口：接收旧数据文件并导入"""
         if not self.check_auth(r): return web.Response(status=403, text="Forbidden")
@@ -1149,7 +1147,6 @@ class MemeMaster(Star):
             reader = await r.multipart()
             memes_data, memory_text, buffer_data = None, "", []
 
-            # 循环读取上传的每一个文件
             while True:
                 field = await reader.next()
                 if not field: break
@@ -1167,14 +1164,12 @@ class MemeMaster(Star):
                     try: buffer_data = json.loads(content.decode('utf-8'))
                     except: pass
 
-            # 呼叫搬运工
             success, msg = self.merge_legacy_data(memes_data, memory_text, buffer_data)
             return web.Response(text=msg if success else "Error: " + msg)
             
         except Exception as e:
             return web.Response(status=500, text=f"Server Error: {str(e)}")
 
-    # === 动作 1: 获取核心记忆列表 ===
     async def h_get_stickies(self, r):
         if not self.check_auth(r): return web.Response(status=403)
         conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
@@ -1186,7 +1181,6 @@ class MemeMaster(Star):
         conn.close()
         return web.json_response(rows)
 
-    # === 动作 2: 增删改核心记忆 ===
     async def h_update_sticky(self, r):
         if not self.check_auth(r): return web.Response(status=403)
         data = await r.json()
@@ -1251,44 +1245,55 @@ class MemeMaster(Star):
         if not all([host, user, pw, to_email]): return "配置不全：请检查SMTP主机、账号、授权码和收件人"
 
         try:
-            # === 新增：计算 images 文件夹大小 ===
+            # 1. 计算大小
             img_size = 0
             for root, _, files in os.walk(self.img_dir):
                 img_size += sum(os.path.getsize(os.path.join(root, name)) for name in files)
             
-            # 限制 20MB (20 * 1024 * 1024)
             include_images = img_size < (20 * 1024 * 1024)
             msg_body = "MemeMaster 自动备份。\n"
             
-            zip_data = io.BytesIO()
-            with zipfile.ZipFile(zip_data, 'w', zipfile.ZIP_DEFLATED) as z:
-                # 1. 核心数据必带
+            # 2. 制作 ZIP
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as z:
                 db_path = os.path.join(self.base_dir, "meme_core.db")
                 if os.path.exists(db_path): z.write(db_path, "meme_core.db")
                 if os.path.exists(self.config_file): z.write(self.config_file, "config.json")
                 
-                # 2. 图片视大小而定
                 if include_images:
                     for root, _, files in os.walk(self.img_dir):
                         for f in files: z.write(os.path.join(root, f), f"images/{f}")
                     msg_body += "✅ 包含完整图片库。"
                 else:
-                    z.writestr("README.txt", "图片库体积超过 20MB，未包含在邮件中。请手动备份 images 文件夹。")
+                    z.writestr("README.txt", "图片库过大，未包含。")
                     msg_body += f"⚠️ 图片库过大 ({img_size/1024/1024:.1f}MB)，仅备份了数据库和配置。"
+            
+            zip_buffer.seek(0)
 
-            from email.mime.text import MIMEText
+            # 3. 组装邮件 (这里就是之前缺少的步骤)
+            msg = MIMEMultipart()
+            msg['Subject'] = f"MemeMaster 备份 - {datetime.datetime.now().strftime('%Y-%m-%d')}"
+            msg['From'] = user
+            msg['To'] = to_email
+            
+            # 添加正文
             msg.attach(MIMEText(msg_body, 'plain', 'utf-8'))
+            
+            # 添加附件
+            part = MIMEBase('application', "octet-stream")
+            part.set_payload(zip_buffer.read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', 'attachment; filename="meme_backup.zip"')
+            msg.attach(part)
 
-            # 2. 定义发送动作（注意：这个 def 要缩进，在这个 async 函数肚子里）
+            # 4. 发送
             def _send():
-                # 使用 SSL 连接 SMTP
                 with smtplib.SMTP_SSL(host, 465) as server:
                     server.login(user, pw)
                     server.send_message(msg)
             
-            # 3. 执行发送
             await asyncio.get_running_loop().run_in_executor(self.executor, _send)
             return "✅ 备份邮件已发送，请查收"
 
         except Exception as e:
-            return f"❌ 发送失败: {str(e)}"
+            return f"❌ 发送失败: {str(e)}")}"
