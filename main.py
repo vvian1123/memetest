@@ -1296,4 +1296,4 @@ class MemeMaster(Star):
             return "✅ 备份邮件已发送，请查收"
 
         except Exception as e:
-            return f"❌ 发送失败: {str(e)}")}"
+            return f"❌ 发送失败: {str(e)}"
