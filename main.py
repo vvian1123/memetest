@@ -99,7 +99,7 @@ class MemeMaster(Star):
         except Exception as e:
             print(f"❌ [Meme] 服务启动失败: {e}", flush=True)
 
-   def init_db(self):
+    def init_db(self):
         """初始化 SQLite 数据库 (v2.0)"""
         db_path = os.path.join(self.base_dir, "meme_core.db")
         conn = sqlite3.connect(db_path)
