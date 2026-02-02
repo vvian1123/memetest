@@ -221,52 +221,38 @@ class MemeMaster(Star):
         # 去重并取前 8 个
         return list(set(candidates))[:8]
     
+    # === 确保这个函数在类里面 ===
     def merge_legacy_data(self, legacy_memes=None, legacy_memory="", legacy_buffer=None):
-        """
-        核心迁移逻辑：把旧的 JSON/TXT 数据无缝融入 SQLite 数据库
-        """
+        """将旧 JSON 数据导入 SQLite"""
         try:
-            db_path = os.path.join(self.base_dir, "meme_core.db")
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
             c = conn.cursor()
-            count_meme = 0
-            count_mem = 0
-
-            # 1. 搬运表情包 (memes.json)
+            count = 0
+            
+            # 1. 导入旧 meme.json
             if legacy_memes:
                 for fn, info in legacy_memes.items():
                     try:
-                        # INSERT OR IGNORE: 如果文件已存在，就自动忽略，保护现有数据
-                        c.execute('''INSERT OR IGNORE INTO memes 
-                                   (filename, tags, source, created_at, feature_hash) 
-                                   VALUES (?, ?, ?, ?, ?)''', 
-                                  (fn, info.get('tags', '未分类'), info.get('source', 'manual'), 
-                                   time.time(), info.get('hash', '')))
-                        if c.rowcount > 0:
-                            count_meme += 1
+                        # 尝试插入，忽略重复
+                        c.execute("INSERT OR IGNORE INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+                                  (fn, info.get('tags'), info.get('source', 'manual'), info.get('hash', ''), time.time()))
+                        count += 1
                     except: pass
-
-            # 2. 搬运长期记忆 (memory.txt)
+            
+            # 2. 导入 memory.txt (作为 Sticky)
             if legacy_memory and legacy_memory.strip():
-                # type='sticky' 代表这是一条至关重要的置顶记忆 (权重10)
-                c.execute('''INSERT INTO memories (content, type, importance, created_at) 
-                             VALUES (?, 'sticky', 10, ?)''', 
-                          (legacy_memory, time.time()))
-                count_mem += 1
-
-            # 3. 搬运短时缓存 (buffer.json)
+                self.save_message_to_db(legacy_memory, 'sticky')
+                
+            # 3. 导入 buffer.json (作为 Dialogue)
             if legacy_buffer and isinstance(legacy_buffer, list):
                 for msg in legacy_buffer:
-                    # type='dialogue' 代表这是普通的对话流水 (权重1)
-                    c.execute('''INSERT INTO memories (content, type, importance, created_at) 
-                                 VALUES (?, 'dialogue', 1, ?)''', 
-                              (str(msg), time.time()))
-                count_mem += 1
-
+                    self.save_message_to_db(str(msg), 'dialogue')
+                    
             conn.commit()
             conn.close()
-            print(f"📦 [Meme] 数据迁移完成: 新增表情 {count_meme} 张, 记忆片段 {count_mem} 条", flush=True)
-            return True, f"成功导入 {count_meme} 张表情，{count_mem} 条记忆"
+            return True, f"成功导入 {count} 张图片记录及相关记忆"
+        except Exception as e:
+            return False, str(e)
             
         except Exception as e:
             print(f"❌ [Meme] 数据迁移失败: {e}", flush=True)
@@ -623,7 +609,25 @@ class MemeMaster(Star):
             "quiet_start": 23, "quiet_end": 7,
             "delay_base": 0.5, "delay_factor": 0.1,
             "web_token": "admin123", # 确保有默认token
-            "ai_prompt": "判断这张图是否适合做表情包。适合回YES并给出<名称>:说明，不适合回NO。",
+            "ai_prompt": 
+            """你是一个专业的表情包筛选员，正在帮我扩充图库。
+            用户发送图片时的配文是：“{context_text}”。(请结合该配文理解，但如果配文在玩梗，请以图片视觉事实为准)
+            
+            【核心原则：严禁幻觉与乱联想】
+            1. 视觉识别必须精准：实事求是，禁止幻觉和过度联想二次元内容！
+            2. 黑名单（遇到以下内容直接回复 NO）：
+            - 严禁 米哈游/原神/崩坏等 miHoYo 相关内容。
+            - 严禁 辱女、性别歧视、黄色暴力或让人不适的烂梗。
+            - 普通的系统截图、无关的风景照、纯文字聊天记录。
+            
+            【判断逻辑】
+            - 只有当图片是有趣的、可爱的、或具有情绪表达价值的表情包（如 Chiikawa、线条小狗、Kpop爱豆表情、猫猫狗狗、经典Meme、梗图）时，才保存。
+            
+            【输出格式】
+            如果不保存，仅回复：NO
+            如果保存，请严格按以下格式回复（若认不出请直接用一句话描述，省略名称）：
+            YES
+            <准确的名称>:一句简短自然的各种场景使用说明""",
             "smtp_host": "", "smtp_user": "", "smtp_pass": "", "email_to": "" # 默认设置为空字符串
         }
         if os.path.exists(self.config_file):
