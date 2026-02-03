@@ -34,6 +34,8 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from email.mime.text import MIMEText  # <--- 新增：修复邮箱报错
+import asyncio 
 import sqlite3
 import io
 import datetime
@@ -64,7 +66,10 @@ class MemeMaster(Star):
         self.config_file = os.path.join(self.base_dir, "config.json")
         self.memory_file = os.path.join(self.base_dir, "memory.txt") 
         self.buffer_file = os.path.join(self.base_dir, "buffer.json") 
-        self.init_db()  # <--- 就加这一行
+        self.init_db()
+
+        self.db_lock = asyncio.Lock()          # 数据库写入锁 (防 locked)
+        self.api_semaphore = asyncio.Semaphore(1) # 鉴图并发锁 (防 429)
         
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.running = True
@@ -146,21 +151,23 @@ class MemeMaster(Star):
         tags = jieba.analyse.extract_tags(text, topK=10, allowPOS=('n', 'nr', 'ns', 'nt', 'nz', 'v', 'vn'))
         return ",".join(tags)
 
-    def save_message_to_db(self, content, msg_type='dialogue'):
-        """保存记忆的通用入口 (0成本)"""
+    async def save_message_to_db(self, content, msg_type='dialogue'):
+        """v24: 异步锁 + 报错屏蔽"""
         if not content: return
-        try:
-            kw = self.extract_keywords(content)
-            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-            c = conn.cursor()
-            # 插入数据
-            c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, ?, ?)",
-                      (content, kw, msg_type, time.time()))
-            # 如果是 Sticky (重要记忆)，把旧的同名 sticky 删掉？暂不需要，AI会看最新的
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"❌ 存库失败: {e}", flush=True)
+        async with self.db_lock: # <--- 关键：拿锁
+            try:
+                kw = self.extract_keywords(content)
+                conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"), timeout=10) # 增加 timeout
+                c = conn.cursor()
+                c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, ?, ?)",
+                          (content, kw, msg_type, time.time()))
+                conn.commit()
+                conn.close()
+            except sqlite3.OperationalError:
+                # 屏蔽 database is locked 报错
+                pass 
+            except Exception as e:
+                print(f"❌ 存库小错误: {e}", flush=True)
 
     def get_related_context(self, current_text):
         """智能检索：找 Sticky + 找相关回忆 (0成本)"""
@@ -197,29 +204,53 @@ class MemeMaster(Star):
         
         conn.close()
         return "\n".join(context_list)
-
+        
     def get_meme_candidates(self, current_text):
-        """智能检索：找相关的表情包"""
+        """v24: 情绪反转 + 关键词混合检索 (让AI做选择)"""
         if not current_text: return []
         
-        # 1. 同样用 jieba 分词
-        kws = [w for w in jieba.cut(current_text) if len(w)>1]
-        if not kws: return []
+        # 1. 情绪反转字典 (用户哭 -> 搜安慰)
+        mood_map = {
+            '负面': {'keywords': ['难过', '哭', '累', '死', '痛', '委屈', '烦', '不开心'], 'search': ['安慰', '抱抱', '摸摸', '贴贴', '爱你']},
+            '正面': {'keywords': ['开心', '哈哈', '笑死', '耶', '棒'], 'search': ['震惊', '庆祝', '无语', '疑惑']}
+        }
         
+        search_terms = set()
+        
+        # 2. 也是用 jieba 分词
+        user_kws = list(jieba.cut(current_text))
+        
+        # 3. 命中情绪词？强制加入反转词
+        hit_mood = False
+        for k in user_kws:
+            for m_type, m_data in mood_map.items():
+                if k in m_data['keywords']:
+                    search_terms.update(m_data['search'])
+                    hit_mood = True
+        
+        # 4. 如果没命中强情绪，或者为了多样性，也加上原文关键词
+        search_terms.update([w for w in user_kws if len(w) > 1])
+        
+        if not search_terms: return []
+
+        # 5. 查库
         conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
         c = conn.cursor()
-        
         candidates = []
-        # 2. 只要标签里包含关键词，就捞出来
-        for w in kws:
-            c.execute("SELECT tags FROM memes WHERE tags LIKE ? ORDER BY usage_count DESC LIMIT 5", (f"%{w}%",))
-            for row in c.fetchall():
-                # tags 格式可能是 "猫:可爱", 我们只要整个
-                candidates.append(row[0])
         
-        conn.close()
-        # 去重并取前 8 个
-        return list(set(candidates))[:8]
+        try:
+            for term in list(search_terms):
+                # 模糊匹配标签
+                c.execute("SELECT tags FROM memes WHERE tags LIKE ? ORDER BY usage_count DESC LIMIT 3", (f"%{term}%",))
+                for row in c.fetchall():
+                    candidates.append(row[0])
+        except: pass
+        finally: conn.close()
+        
+        # 6. 随机打散并取前 6 个，给 AI 更多选择空间
+        final_list = list(set(candidates))
+        random.shuffle(final_list)
+        return final_list[:6]
     
    # === 替换这个函数 ===
     def merge_legacy_data(self, legacy_memes=None, legacy_memory="", legacy_buffer=None):
@@ -238,9 +269,19 @@ class MemeMaster(Star):
                         count += 1
                     except: pass
             
-            # 2. 导入 memory.txt
+            # 2. 导入 memory.txt (智能切片)
             if legacy_memory and legacy_memory.strip():
-                self.save_message_to_db(legacy_memory, 'sticky')
+                # 按空行分割
+                fragments = legacy_memory.replace("\r\n", "\n").split("\n\n")
+                for frag in fragments:
+                    frag = frag.strip()
+                    if not frag: continue
+                        # 提取关键词
+                        kw = self.extract_keywords(frag)
+                        try:
+                            c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'fragment', ?)",
+                                      (frag, kw, time.time()))
+                        except: pass
                 
             # 3. 导入 buffer.json
             if legacy_buffer and isinstance(legacy_buffer, list):
@@ -255,68 +296,47 @@ class MemeMaster(Star):
             return False, str(e)
 
     def get_db_context(self, current_query=""):
-        """
-        全能读取器：
-        1. 必读：核心规则 (Sticky)
-        2. 联想：根据你现在说的话，去搜相关的旧片段 (Fragment)
-        3. 补全：最近的对话流水 (Dialogue)
-        """
+        """v24: 只提取 Sticky + 强相关记忆 (非最近)"""
         try:
             conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
             
-            # 1. 取出核心规则 (永远置顶)
-            c.execute("SELECT content FROM memories WHERE type='sticky' ORDER BY importance DESC")
+            # 1. Sticky: 按冷却策略，这里只取数据，注入逻辑在 handler 里做
+            c.execute("SELECT content FROM memories WHERE type='sticky'")
             stickies = [row['content'] for row in c.fetchall()]
 
-            related_memories = []
+            related_fragments = []
             
-            # 2. 联想召回
-            related_memories = []
+            # 2. 相关性检索：用户说什么，去库里找最匹配的 2 段 (可能是很久以前的)
             if current_query:
-                # 使用 jieba 进行搜索引擎模式分词，并过滤掉单字（停用词）
+                # 提取关键词
                 query_words = [w for w in jieba.cut_for_search(current_query) if len(w) > 1]
-    
                 if query_words:
                     conditions = []
                     params = []
                     for w in query_words:
                         conditions.append("(keywords LIKE ? OR content LIKE ?)")
                         params.extend([f"%{w}%", f"%{w}%"])
-        
-                    if conditions:
-                        # 限制只找最相关的 3 条
-                        sql = f"SELECT content FROM memories WHERE type='fragment' AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 3"
+                    
+                    if conditions and params:
+                        # ★★★ 核心：只找 2 条最相关的旧记录 ★★★
+                        sql = f"SELECT content FROM memories WHERE type IN ('dialogue', 'fragment') AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 2"
                         c.execute(sql, tuple(params))
-                        related_memories = [row['content'] for row in c.fetchall()]
-
-            # 3. 兜底：如果没联想到，就拿最近生成的 2 条碎片看看
-            c.execute("SELECT content FROM memories WHERE type='fragment' ORDER BY created_at DESC LIMIT 2")
-            recent_memories = [row['content'] for row in c.fetchall()]
-            
-            # 4. 关键：取出最近 15 条对话 (填补短期记忆空白)
-            c.execute("SELECT content FROM memories WHERE type='dialogue' ORDER BY created_at DESC LIMIT 15")
-            dialogues = [row['content'] for row in c.fetchall()][::-1] # 反转回正序
+                        related_fragments = [f"【相关回忆】{row['content']}" for row in c.fetchall()]
 
             conn.close()
             
-            # 去重合并
-            final_fragments = list(set(related_memories + recent_memories))
-
+            # 组装
             context_list = []
-            if stickies: 
-                context_list.append("【绝对规则/核心设定】\n" + "\n".join(stickies))
-            if final_fragments: 
-                context_list.append("【相关回忆/背景】\n" + "\n".join(final_fragments))
-            if dialogues: 
-                context_list.append("【最近的对话】\n" + "\n".join(dialogues))
+            # Sticky 不在这里拼装，由主逻辑控制频率
+            if related_fragments: 
+                context_list.extend(related_fragments)
                 
-            return "\n\n".join(context_list).strip()
+            return stickies, "\n".join(context_list) # 返回元组
         except Exception as e:
-            print(f"❌ 读取记忆出错: {e}")
-            return ""
-
+            return [], ""
+            
     def __del__(self):
         self.running = False 
 
@@ -361,24 +381,19 @@ class MemeMaster(Star):
             self.last_uid = uid
             self.last_session_id = event.session_id
 
-            # 自动进货 (逻辑微调：只处理图)
+            # 自动进货 (逻辑微调：加冷却判断)
             if img_urls:
                 cd = float(self.local_config.get("auto_save_cooldown", 60))
                 if time.time() - self.last_auto_save_time > cd:
                     self.last_auto_save_time = time.time()
                     for url in img_urls:
-                        # 丢给后台异步去跑，不卡顿
+                        # 传入 msg_str 作为上下文！
                         asyncio.create_task(self.ai_evaluate_image(url, msg_str))
 
             # 指令穿透 (保持不变)
             if (msg_str.startswith("/") or msg_str.startswith("！")) and not img_urls:
                 if uid in self.sessions: self.sessions[uid]['flush_event'].set()
                 return 
-
-            # 防抖逻辑 (保持不变，省略中间代码，请保留原有的防抖代码块...)
-            # ... (这里保留原有的 debounce 代码，为了篇幅我不重复贴了，逻辑没变) ...
-            # -------------------------------------------------------------
-            
             
             # 防抖逻辑
             try: debounce_time = float(self.local_config.get("debounce_time", 3.0))
@@ -427,36 +442,39 @@ class MemeMaster(Star):
 
             # === 核心修改区开始 ===
             
-            # 1. 存入用户消息 (流水账) 
-            if msg_str:
-                self.save_message_to_db(f"User: {msg_str}", 'dialogue')
+            # 1. 【防应声虫】：绝对不在这里 save_message_to_db (User)！
+            # 我们把用户的话暂存在 event 对象里，传给 on_output
+            event.user_text_raw = msg_str 
 
-            # 2. 准备 System Context (Prompt注入)
+            # 2. 准备 System Context
             time_info = self.get_full_time_str()
             system_context = [f"Time: {time_info}"]
             
-            # 3. 智能检索记忆 (Sticky + Recall) 
-            db_context = self.get_related_context(msg_str)
-            if db_context:
-                system_context.append(f"Memory System:\n{db_context}")
+            # 3. 检索记忆 (返回 stickies 列表 和 相关文本)
+            stickies, related_context = self.get_db_context(msg_str)
             
-            # 4. 智能检索表情包
+            # 4. Sticky 冷却注入逻辑
+            # 每 10 句才全量注入一次 Sticky，防止 Token 爆炸
+            if self.msg_count % 10 == 0 and stickies:
+                sticky_str = " ".join([f"({s})" for s in stickies])
+                system_context.append(f"Important Facts: {sticky_str}")
+
+            # 5. 注入相关回忆 (如果有)
+            if related_context:
+                system_context.append(f"Relevant Past: {related_context}")
+            
+            # 6. 智能检索表情包 (情绪反转版)
             meme_hints = self.get_meme_candidates(msg_str)
             if meme_hints:
-                # 只有匹配到了才给 AI，没匹配到就不给，防止乱发
+                # 提示 AI 有这些图可选
                 hints_str = " ".join([f"<MEME:{t}>" for t in meme_hints])
-                system_context.append(f"Available Memes (Use ONLY if fitting): {hints_str}")
-            else:
-                # 只有在没匹配到时，才给几个热门的随机保底 (可选)
-                pass 
+                system_context.append(f"Available Memes (Select Best): {hints_str}")
 
-            # 5. 注入“主动记忆”指令 (告诉 AI 怎么存重要信息)
-            system_context.append("Instruction: If the user mentions a PERMANENT FACT (e.g., birthday, distinct preference, rule), append '[[MEM: content]]' at the end.")
+            # 7. 计数 +1
+            self.msg_count += 1
 
-            print(f"🧠 [Meme] Context注入: 记忆={bool(db_context)} | 表情候选={len(meme_hints)}", flush=True)
-
-            # 6. 构造最终发给 AstrBot 的文本
-            # AstrBot 会自己带上最近的对话历史，我们只补全它不知道的
+            # 8. 构造最终文本
+            # AstrBot 自带最近几轮 Context，我们只补全它不知道的
             final_text = f"{msg_str}\n\n(System Context: {' | '.join(system_context)})"
             
             event.message_str = final_text
@@ -465,9 +483,9 @@ class MemeMaster(Star):
             event.message_obj.message = chain
             
         except Exception as e:
-            print(f"❌ [Meme] Error: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
+            # 屏蔽空消息日志
+            if "not defined" not in str(e): # 过滤常见无关报错
+                print(f"❌ [Meme] Handle Error: {e}", flush=True)
 
 
     @filter.on_decorating_result(priority=0)
@@ -477,7 +495,6 @@ class MemeMaster(Star):
         result = event.get_result()
         if not result: return
         
-        # 1. 提取纯文本
         text = ""
         if isinstance(result, list):
             for c in result:
@@ -490,26 +507,34 @@ class MemeMaster(Star):
         if not text: return
         setattr(event, "__meme_processed", True)
         
-        # 2. 净化文本 (去 Markdown)
         text = self.clean_markdown(text)
         
-        # === 核心修改：检测主动记忆指令 [[MEM: ...]] ===
+        # 如果 AI 输出了 [[MEM:生日是5.20]]，立刻拦截并存入 Sticky
         mem_match = re.search(r"\[\[MEM:(.*?)\]\]", text)
         if mem_match:
             mem_content = mem_match.group(1).strip()
             if mem_content:
-                print(f"📝 [Meme] AI 提取重要记忆: {mem_content}", flush=True)
-                # 存为 Sticky (重要记忆)
-                self.save_message_to_db(mem_content, 'sticky')
-            # 从回复给用户的文本里删掉这行指令
+                print(f"📝 [Meme] AI 捕获重要事实: {mem_content}", flush=True)
+                # 存为 sticky 类型
+                await self.save_message_to_db(mem_content, 'sticky')
+            # 从回复给用户的文本里删掉这行指令，用户看不到
             text = text.replace(mem_match.group(0), "").strip()
 
-        # 3. 存 AI 回复入库 (流水账)
-        clean_text_for_log = re.sub(r"\(System Context:.*?\)", "", text).strip()
-        self.save_message_to_db(f"AI: {clean_text_for_log}", 'dialogue')
+        # 防应声虫：成对存库
+        user_raw = getattr(event, "user_text_raw", "")
+        ai_clean = re.sub(r"\(System Context:.*?\)", "", text).strip()
+        
+        if user_raw and ai_clean:
+            pair_log = f"User: {user_raw}\nAI: {ai_clean}"
+            self.chat_history_buffer.append(pair_log)
+            self.save_buffer_to_disk()
+            await self.save_message_to_db(pair_log, 'dialogue')
+        
+        if not self.is_summarizing:
+            asyncio.create_task(self.check_and_summarize())
 
         try:
-            # 4. 表情包解析逻辑 (基本保持不变，只是适配了新的 text 变量)
+            # 表情包解析 (和之前一样)
             pattern = r"(<MEME:.*?>|MEME_TAG:\s*[\S]+)"
             parts = re.split(pattern, text)
             mixed_chain = []
@@ -521,25 +546,21 @@ class MemeMaster(Star):
                 elif "MEME_TAG:" in part: tag = part.replace("MEME_TAG:", "").strip()
                 
                 if tag:
-                    # 去库里找文件路径
-                    path = self.find_best_match(tag) # 需要微调 find_best_match 适配 SQLite
+                    path = self.find_best_match(tag)
                     if path: 
                         print(f"🎯 [Meme] 命中表情包: [{tag}]", flush=True)
                         mixed_chain.append(Image.fromFileSystem(path))
                         has_meme = True
                 elif part:
-                    clean_part = part.replace("(System Context:", "").replace(")", "").strip()
+                    clean_part = re.sub(r"\(System Context:.*?\)", "", part).strip()
                     if clean_part: mixed_chain.append(Plain(clean_part))
             
-            # 如果没表情包且字数极少，可能只是语气词，不管
-            if not has_meme and len(text) < 50 and "\n" not in text: 
-                # 这里如果刚才删除了 [[MEM]] 导致文本变了，需要更新回去
+            if not has_meme and len(text) < 50 and "\n" not in text:
+                # 如果刚才删了 [[MEM]] 导致文本变了，需要更新回去，否则 AstrBot 发的是旧的
                 if mem_match: 
-                    # 重新构造个纯文本链
                     event.set_result(MessageChain([Plain(text)]))
                 return
 
-            # 分段发送逻辑 (保持不变)
             segments = self.smart_split(mixed_chain)
             delay_base = self.local_config.get("delay_base", 0.5)
             delay_factor = self.local_config.get("delay_factor", 0.1)
@@ -553,11 +574,11 @@ class MemeMaster(Star):
                 await self.context.send_message(event.unified_msg_origin, mc)
                 if i < len(segments) - 1: await asyncio.sleep(wait)
             
-            event.set_result(None) # 阻止原始消息发送 (因为我们分段发了)
+            event.set_result(None) 
 
         except Exception as e:
             print(f"❌ [Meme] 输出处理出错: {e}", flush=True)
-
+            
     def clean_markdown(self, text):
         text = re.sub(r"(?si)[\s\.]*thought.*?End of thought", "", text)
         text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL)
@@ -581,7 +602,7 @@ class MemeMaster(Star):
                     elif stack and char == self.pair_map[stack[-1]]: stack.pop()
                     
                     is_split_char = char in self.split_chars
-                    force_split = (len(chunk) > 80)
+                    force_split = False
                     
                     if (not stack and is_split_char) or force_split:
                         chunk += char
@@ -644,127 +665,127 @@ class MemeMaster(Star):
             except: pass
             
     async def check_and_summarize(self):
-        """自动消化系统 v3.0：确保总结成功才删除缓存，失败则持续累积"""
+        """v24: 纯粹的总结逻辑 (只生成 Fragment，不重复提取 Sticky)"""
         threshold = self.local_config.get("summary_threshold", 40)
-        # 如果还没到条数，或者正在总结中，就不动
         if len(self.chat_history_buffer) < threshold or self.is_summarizing: 
             return
         
         self.is_summarizing = True 
         try:
-            print(f"🧠 [Meme] 正在尝试总结记忆 (当前积压: {len(self.chat_history_buffer)} 条)...", flush=True)
+            print(f"🧠 [Meme] 正在消化记忆 (积压: {len(self.chat_history_buffer)} 条)...", flush=True)
             now_str = self.get_full_time_str()
             history_text = "\n".join(self.chat_history_buffer)
             
             provider = self.context.get_using_provider()
-            if not provider: 
-                self.is_summarizing = False
-                return
+            if not provider: return
             
-            prompt = f"""
-            Task: Analyze the conversation for Long-term Memory.
-            Current Time: {now_str}
-            
-            Output a JSON object with 3 fields:
-            1. "summary" (Required): A concise summary of the conversation flow (under 200 words).
-            2. "keywords" (Required): Comma-separated keywords for search.
-            3. "sticky_content" (Optional): 
-               - ONLY if the user explicitly defined a PERMANENT RULE, STRONG PREFERENCE, or IMPORTANT FACT (e.g., "Call me Baby", "My birthday is 5/20", "Never eat spicy food").
-               - If found, extract it as a short, absolute statement.
-               - If nothing critical found, leave this field empty string "".
-            
-            Conversation:
-            {history_text}
-            """
+            # 使用 1.txt 风格的简单提示词
+            prompt = f"""当前时间：{now_str}
+                这是一段过去的对话记录。请将其总结为一段简练的“长期记忆”或“日记”。
+                重点记录：用户的喜好、发生的重要事件、双方约定的事情。
+                忽略：无意义的寒暄、重复的表情包指令。
+                字数限制：200字以内。
+                
+                对话内容：
+                {history_text}"""
             
             resp = await provider.text_chat(prompt, session_id=None)
-            raw_text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
+            summary = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
+            # 简单清洗一下
+            summary = self.clean_markdown(summary)
             
-            # 解析结果
-            summary, keywords, sticky = "", "", ""
-            try:
-                clean_json = raw_text.replace("```json", "").replace("```", "").strip()
-                data = json.loads(clean_json)
-                summary = f"[{now_str}] {data.get('summary', '')}"
-                keywords = data.get('keywords', '')
-                sticky = data.get('sticky_content', '').strip()
-            except:
-                # 兜底：如果AI没回JSON，就把全文当总结
-                summary = f"[{now_str}] {raw_text[:200]}"
-                keywords = "history"
-
-            # 写入数据库
-            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-            c = conn.cursor()
             if summary:
-                c.execute("INSERT INTO memories (content, type, keywords, importance, created_at) VALUES (?, 'fragment', ?, 5, ?)", 
-                          (summary, keywords, time.time()))
-            if sticky:
-                c.execute("SELECT id FROM memories WHERE type='sticky' AND content=?", (sticky,))
-                if not c.fetchone():
-                    c.execute("INSERT INTO memories (content, type, importance, created_at) VALUES (?, 'sticky', 10, ?)", 
-                              (sticky, time.time()))
-            conn.commit()
-            conn.close()
-            
-            # 【关键】只有走到这一步（成功写入DB），才清空 buffer
-            self.chat_history_buffer = [] 
-            self.save_buffer_to_disk()
-            print(f"✨ [Meme] 记忆消化完成，已清空缓存。", flush=True)
+                # 加上时间戳标题，存为片段
+                full_summary = f"--- {now_str} 总结 ---\n{summary}"
+                await self.save_message_to_db(full_summary, 'fragment')
+                
+                # 清空 buffer
+                self.chat_history_buffer = [] 
+                self.save_buffer_to_disk()
+                print(f"✨ [Meme] 总结完成，已存入片段库。", flush=True)
 
         except Exception as e:
-            print(f"❌ [Meme] 消化失败 (保留缓存待下次重试): {e}", flush=True)
+            print(f"❌ [Meme] 总结失败: {e}", flush=True)
         finally:
             self.is_summarizing = False
             
-    # === 替换这个函数 ===
     async def ai_evaluate_image(self, img_url, context_text=""):
-        try:
-            img_data = None
-            async with aiohttp.ClientSession() as s:
-                async with s.get(img_url) as r:
-                    if r.status == 200: img_data = await r.read()
-            if not img_data: return
-            
-            current_hash = await self._calc_hash_async(img_data)
-            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-            c = conn.cursor()
-            c.execute("SELECT filename FROM memes WHERE feature_hash = ?", (current_hash,))
-            exists = c.fetchone()
-            conn.close()
-            
-            if exists:
-                print(f"♻️ [自动进货] 图片已存在，跳过", flush=True)
-                return
+        """v24 Ultimate: 并发锁 + 上下文注入 + 数据库锁 + 详细报错"""
+        # 1. API 通行证：串行执行防 429
+        async with self.api_semaphore:
+            try:
+                # 下载图片
+                img_data = None
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(img_url, timeout=15) as r:
+                        if r.status == 200: 
+                            img_data = await r.read()
+                        else:
+                            print(f"⚠️ [自动进货] 图片下载失败 (HTTP {r.status}): {img_url}")
+                            return
+                if not img_data: return
+                
+                # 2. 计算指纹并去重
+                current_hash = await self._calc_hash_async(img_data)
+                
+                conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+                c = conn.cursor()
+                c.execute("SELECT filename FROM memes WHERE feature_hash = ?", (current_hash,))
+                exists = c.fetchone()
+                conn.close()
+                
+                if exists:
+                    print(f"♻️ [自动进货] 指纹匹配，跳过重复图")
+                    return
 
-            provider = self.context.get_using_provider()
-            if not provider: return
-            
-            raw_prompt = self.local_config.get("ai_prompt", "")
-            prompt = raw_prompt.replace("{context_text}", context_text) if "{context_text}" in raw_prompt else raw_prompt
-            
-            resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
-            content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
-            
-            if "YES" in content:
-                match = re.search(r"<(?P<tag>.*?)>[:：]?(?P<desc>.*)", content)
+                # 3. 准备 AI 鉴图
+                provider = self.context.get_using_provider()
+                if not provider:
+                    print("❌ [自动进货] 错误: 无法获取 AI Provider")
+                    return
+                
+                raw_prompt = self.local_config.get("ai_prompt", "")
+                # 注入用户发图时的配文上下文
+                prompt = raw_prompt.replace("{context_text}", context_text) if "{context_text}" in raw_prompt else raw_prompt
+                
+                resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
+                content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
+                
+                # 4. 处理 AI 回复
+                if "YES" in content:
+                    match = re.search(r"<(?P<tag>.*?)>[:：]?(?P<desc>.*)", content)
+                    if match:
+                        full_tag = f"{match.group('tag').strip()}: {match.group('desc').strip()}"
+                        print(f"🖤 [自动进货] 识图成功: {full_tag}")
+                        
+                        comp, ext = await self._compress_image(img_data)
+                        fn = f"{int(time.time())}_{random.randint(100,999)}{ext}"
+                        with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(comp)
+                        
+                        # 5. 写入数据库 (加异步锁)
+                        async with self.db_lock:
+                            try:
+                                conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+                                c = conn.cursor()
+                                c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, 'auto', ?, ?)", 
+                                          (fn, full_tag, current_hash, time.time()))
+                                conn.commit()
+                                conn.close()
+                            except sqlite3.Error as db_err:
+                                print(f"❌ [自动进货] 数据库写入失败: {db_err}")
+                    else:
+                        print(f"⚠️ [自动进货] AI 同意存图但格式解析失败: {content[:50]}...")
+                elif "NO" in content:
+                    # AI 判定不存，这是正常逻辑，不用打印错误
+                    pass
+                else:
+                    print(f"⚠️ [自动进货] AI 回复内容未包含 YES/NO: {content[:50]}...")
 
-                if match:
-                    full_tag = f"{match.group('tag').strip()}: {match.group('desc').strip()}"
-                    print(f"🖤 [自动进货] 入库: {full_tag}", flush=True)
-                    
-                    comp, ext = await self._compress_image(img_data)
-                    fn = f"{int(time.time())}{ext}"
-                    with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(comp)
-                    
-                    conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-                    c = conn.cursor()
-                    c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, 'auto', ?, ?)", 
-                              (fn, full_tag, current_hash, time.time()))
-                    conn.commit()
-                    conn.close()
-        except Exception as e:
-            print(f"❌ [Meme] 自动识图出错: {e}", flush=True)
+            except asyncio.TimeoutError:
+                print(f"❌ [自动进货] 请求超时 (网络问题)")
+            except Exception as e:
+                # 打印所有未预见的异常
+                print(f"❌ [自动进货] 识图任务执行出错: {e}")
 
     async def _lonely_watcher(self):
         while self.running: 
