@@ -252,7 +252,6 @@ class MemeMaster(Star):
         random.shuffle(final_list)
         return final_list[:6]
     
-   # === 替换这个函数 ===
     def merge_legacy_data(self, legacy_memes=None, legacy_memory="", legacy_buffer=None):
         """将旧 JSON 数据导入 SQLite"""
         try:
@@ -271,16 +270,41 @@ class MemeMaster(Star):
             
             # 2. 导入 memory.txt (智能切片)
             if legacy_memory and legacy_memory.strip():
-                # 按空行分割
-                fragments = legacy_memory.replace("\r\n", "\n").split("\n\n")
+                import re
+                if "---" in legacy_memory:
+                    # 使用正则切分，保留分割线标题
+                    # 这个正则会匹配 --- 到下一个 --- 之间的内容
+                    pattern = r"(--- \d{4}-\d{2}-\d{2}.*?---)"
+                    parts = re.split(pattern, legacy_memory)
+                    
+                    fragments = []
+                    current_header = ""
+                    for p in parts:
+                        p = p.strip()
+                        if not p: continue
+                        if p.startswith("---") and p.endswith("---"):
+                            current_header = p # 记下日期头
+                        else:
+                            # 把日期头和具体内容拼在一起，形成一个完整的“记忆块”
+                            full_block = f"{current_header}\n{p}"
+                            fragments.append(full_block)
+                else:
+                    fragments = legacy_memory.split("\n\n")
+
                 for frag in fragments:
-                    frag = frag.strip()
-                    if not frag: continue
-                    kw = self.extract_keywords(frag)
+                    content = frag.strip()
+                    if not content: continue
+                    kw = self.extract_keywords(content)
                     try:
                         c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'fragment', ?)",
-                                  (frag, kw, time.time()))
+                                  (content, kw, time.time()))
                     except: pass
+
+            conn.commit()
+            conn.close()
+            return True, "数据迁移成功：已按日期和段落完成智能切片"
+        except Exception as e:
+            return False, str(e)
                 
             # 3. 导入 buffer.json
             if legacy_buffer and isinstance(legacy_buffer, list):
