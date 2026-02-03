@@ -241,7 +241,7 @@
             <div id="tab-memory" class="tab-content">
                 <div style="background:#fffbeb; padding:15px; border-radius:16px; margin-bottom:20px; color:#92400e; font-size:0.9rem;">
                     📌 <strong>核心记忆 (Sticky Notes)</strong><br>
-                    最高优先级注入。适合记录：纪念日、喜好、雷点、生理周期等。
+                    最高优先级注入。适合记录：纪念日、喜好、雷点、生理周期等简短重要提示内容。如需长篇幅请前往astrbot人设修改。
                 </div>
                 <div style="display:flex; gap:10px; margin-bottom:20px;">
                     <input type="text" id="newStickyInput" placeholder="例如: 纪念日是5月20日" 
@@ -374,8 +374,8 @@
                 const fd = new FormData(); fd.append('file', files[i]); fd.append('tags', tag||"未分类");
                 await fetch(`/upload?token=${token}`, {method:'POST', body:fd});
             }
-            fill.style.width = '100%'; status.innerText = '🎉 完成！刷新中...';
-            setTimeout(() => location.reload(), 1000);
+            fill.style.width = '100%'; status.innerText = '🎉 完成！等待数据库同步...';
+            setTimeout(() => location.reload(), 1500);
         }
 
         function backupData() { window.location.href = `/backup?token=${token}`; showToast('📦 正在打包...'); }
