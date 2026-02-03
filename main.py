@@ -276,12 +276,11 @@ class MemeMaster(Star):
                 for frag in fragments:
                     frag = frag.strip()
                     if not frag: continue
-                        # 提取关键词
-                        kw = self.extract_keywords(frag)
-                        try:
-                            c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'fragment', ?)",
-                                      (frag, kw, time.time()))
-                        except: pass
+                    kw = self.extract_keywords(frag)
+                    try:
+                        c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'fragment', ?)",
+                                  (frag, kw, time.time()))
+                    except: pass
                 
             # 3. 导入 buffer.json
             if legacy_buffer and isinstance(legacy_buffer, list):
