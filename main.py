@@ -1215,7 +1215,7 @@ class MemeMaster(Star):
         data_for_web = {row['filename']: {"tags": row['tags'], "source": row['source']} for row in rows}
         
         token = self.local_config["web_token"]
-        html = self.read_file("index.html").replace("{{MEME_DATA}}", json.dumps(data_for_web)).replace("admin123", token)
+        html = self.read_file("index.html").replace("{{ MEME_DATA }}", json.dumps(data_for_web)).replace("admin123", token)
         return web.Response(text=html, content_type="text/html")
     async def h_gcf(self,r):
         if not self.check_auth(r): return web.Response(status=403)
