@@ -599,6 +599,10 @@
             <div style="font-size:3rem; margin-bottom:15px;">📥</div>
             <h3 style="margin:0;">正在恢复</h3>
             <p style="color:#64748b; font-size:0.9rem;">请勿关闭页面...</p>
+            <div class="progress-container" style="margin-top:20px; width:100%;">
+                <div class="progress-fill" id="restoreProgress" style="width:0%"></div>
+            </div>
+            <div id="restoreStatus" style="font-size:0.8rem; color:#94a3b8; margin-top:5px;">0%</div>
         </div>
     </div>
 
@@ -811,13 +815,55 @@
             const f = document.getElementById('restoreInput').files[0];
             if (!f) return;
             if (!confirm('⚠️ 恢复将覆盖现有数据，确定吗？')) return;
-            document.getElementById('restoreModal').style.display = 'flex';
-            const fd = new FormData(); fd.append('file', f);
-            fetch(`/restore?token=${token}`, { method: 'POST', body: fd })
-                .then(r => {
-                    if (r.ok) { alert('✅ 恢复成功！'); location.reload(); }
-                    else alert('❌ 失败');
-                }).catch(() => alert('❌ 网络错误')).finally(() => document.getElementById('restoreModal').style.display = 'none');
+
+            // 1. 显示模态框和初始化进度条
+            const modal = document.getElementById('restoreModal');
+            const pBar = document.getElementById('restoreProgress');
+            const pStatus = document.getElementById('restoreStatus');
+            modal.style.display = 'flex';
+            pBar.style.width = '0%';
+            pStatus.innerText = '0%';
+
+            // 2. 准备上传
+            const fd = new FormData();
+            fd.append('file', f);
+
+            // 3. 使用 XMLHttpRequest (XHR) 实现进度监控
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `/restore?token=${token}`, true);
+
+            // 监听上传进度
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    pBar.style.width = percent + '%';
+                    pStatus.innerText = percent + '%';
+                }
+            };
+
+            // 监听完成
+            xhr.onload = () => {
+                if (xhr.status === 200) {
+                    pBar.style.width = '100%';
+                    pStatus.innerText = '100%';
+                    setTimeout(() => {
+                        alert('✅ 恢复成功！即将刷新页面...');
+                        location.reload();
+                    }, 500);
+                } else {
+                    alert('❌ 恢复失败: ' + xhr.responseText);
+                    modal.style.display = 'none';
+                }
+            };
+
+            // 监听错误
+            xhr.onerror = () => {
+                alert('❌ 网络错误');
+                modal.style.display = 'none';
+            };
+
+            // 发送请求
+            xhr.send(fd);
         }
 
         function switchTab(id, el) {

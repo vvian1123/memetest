@@ -251,6 +251,12 @@ class MemeMaster(Star):
                 c.execute("SELECT tags FROM memes WHERE tags LIKE ? ORDER BY usage_count DESC LIMIT 3", (f"%{term}%",))
                 for row in c.fetchall():
                     candidates.append(row[0])
+            # === 保底机制：如果搜出来的太少，随机补货 ===
+            if len(candidates) < 2:
+                # 随机拿 5 个，保证 AI 只要想发图总有货
+                c.execute("SELECT tags FROM memes ORDER BY RANDOM() LIMIT 3")
+                for row in c.fetchall():
+                    candidates.append(row[0])
         except: pass
         finally: conn.close()
         
