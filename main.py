@@ -529,7 +529,8 @@ class MemeMaster(Star):
             sticky_freq = ab_rounds if ab_rounds <= 20 else ab_rounds // 2
             if self.round_count % sticky_freq == 0 and stickies:
                 sticky_str = " ".join([f"({s})" for s in stickies])
-                system_tag += f"Important Facts: {sticky_str}\n"
+                system_tag += f"Important Facts (Established Knowledge): {sticky_str}\n"
+                system_tag += "(NOTE: You already KNOW these facts. Do NOT repeat them in your response unless asked.)\n"
 
             # 5. 注入相关回忆 (如果有)
             if related_context:
