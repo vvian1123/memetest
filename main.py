@@ -533,7 +533,8 @@ class MemeMaster(Star):
 
             # 5. 注入相关回忆 (如果有)
             if related_context:
-                system_tag += f"Relevant Past: {related_context}\n"
+                system_tag += f"Historical Context (Recall): {related_context}\n"
+                system_tag += "(NOTE: The above 'Historical Context' is for background info ONLY. Do NOT reply to it as if it marks the current conversation state.)\n"
             
             # 6. 智能检索表情包 (异步执行)
             meme_hints = await asyncio.to_thread(self.get_meme_candidates, msg_str)
