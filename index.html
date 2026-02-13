@@ -620,7 +620,9 @@
 
     <div class="modal-overlay" id="settingsModal">
         <div class="modal">
-            <h3 style="margin:0 0 20px 0;">配置中心</h3>
+            <h3 style="margin:0 0 20px 0;"
+                ondblclick="document.getElementById('legacyImportSection').style.display='block'; showToast('🔓 已解锁旧数据迁移')">
+                配置中心</h3>
 
             <div class="tabs">
                 <div class="tab active" onclick="switchTab('tab-meme', this)">图库</div>
@@ -638,7 +640,8 @@
                 <button class="btn-primary" style="background:#fff7ed; color:#d97706;" onclick="slimImages()">⚡
                     一键瘦身</button>
 
-                <div style="margin-top:20px; border-top:1px dashed #e2e8f0; padding-top:15px;">
+                <div style="margin-top:20px; border-top:1px dashed #e2e8f0; padding-top:15px; display:none;"
+                    id="legacyImportSection">
                     <h4 style="margin:0 0 10px 0; font-size:0.9rem; color:#64748b;">📦 旧数据迁移</h4>
                     <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:10px;">上传旧版 memes.json / memory.txt /
                         buffer.json</div>
@@ -668,7 +671,11 @@
             <div id="tab-logic" class="tab-content">
                 <div class="form-group"><label>防抖等待 (秒)</label><input type="number" id="conf_debounce_time"></div>
                 <div class="form-group"><label>基础延迟 (秒)</label><input type="number" id="conf_delay_base"></div>
-                <div class="form-group"><label>字数延迟系数</label><input type="number" id="conf_delay_factor"></div>
+                <div class="form-group">
+                    <label>字数延迟系数</label>
+                    <input type="number" id="conf_delay_factor">
+                    <div class="hint">每增加1个字符，额外延迟多少秒（推荐 0.05~0.2）</div>
+                </div>
                 <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
                 <div class="form-group">
                     <label>AstrBot 上下文轮数</label>

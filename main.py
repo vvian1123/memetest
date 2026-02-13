@@ -519,33 +519,34 @@ class MemeMaster(Star):
 
             # 2. 准备 System Context
             time_info = self.get_full_time_str()
-            system_context = [f"Time: {time_info}"]
+            system_tag = f"<system_context>\nTime: {time_info}\n"
             
-            # 3. 检索记忆 (返回 stickies 列表 和 相关文本)
-            stickies, related_context = self.get_db_context(msg_str)
+            # 3. 检索记忆 (异步执行，防止阻塞)
+            stickies, related_context = await asyncio.to_thread(self.get_db_context, msg_str)
             
             # 4. Sticky 冷却注入逻辑（频率由 ab_context_rounds 自动计算）
             ab_rounds = int(self.local_config.get("ab_context_rounds", 50))
             sticky_freq = ab_rounds if ab_rounds <= 20 else ab_rounds // 2
             if self.round_count % sticky_freq == 0 and stickies:
                 sticky_str = " ".join([f"({s})" for s in stickies])
-                system_context.append(f"Important Facts: {sticky_str}")
+                system_tag += f"Important Facts: {sticky_str}\n"
 
             # 5. 注入相关回忆 (如果有)
             if related_context:
-                system_context.append(f"Relevant Past: {related_context}")
+                system_tag += f"Relevant Past: {related_context}\n"
             
-            # 6. 智能检索表情包 (情绪反转版)
-            meme_hints = self.get_meme_candidates(msg_str)
+            # 6. 智能检索表情包 (异步执行)
+            meme_hints = await asyncio.to_thread(self.get_meme_candidates, msg_str)
             if meme_hints:
                 # 提示 AI 有这些图可选
                 hints_str = " ".join([f"<MEME:{t}>" for t in meme_hints])
-                system_context.append(f"Available Memes (Select Best): {hints_str}")
+                system_tag += f"Available Memes (Random/Select): {hints_str}\n"
 
+            system_tag += "</system_context>"
 
             # 7. 构造最终文本
-            # AstrBot 自带最近几轮 Context，我们只补全它不知道的
-            final_text = f"{msg_str}\n\n(System Context: {' | '.join(system_context)})"
+            # 使用 XML 标签包裹系统上下文，让 AI 清晰区分 System 和 User
+            final_text = f"{msg_str}\n\n{system_tag}"
             
             event.message_str = final_text
             chain = [Plain(final_text)]
@@ -593,7 +594,10 @@ class MemeMaster(Star):
 
         # 防应声虫：成对存库
         user_raw = getattr(event, "user_text_raw", "")
+        
+        # 清理掉 System Context (兼容旧版和新 XML 版)
         ai_clean = re.sub(r"\(System Context:.*?\)", "", text).strip()
+        ai_clean = re.sub(r"<system_context>.*?</system_context>", "", ai_clean, flags=re.DOTALL).strip()
         ai_clean = re.sub(r"<MEME:.*?>", "", ai_clean).strip()  # 也清掉 meme 标签
         
         if user_raw and ai_clean:
