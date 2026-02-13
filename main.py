@@ -2,7 +2,7 @@ import subprocess
 import sys
 import importlib
 
-DEPENDENCIES = ["jieba", "lunar_python", "Pillow"]
+DEPENDENCIES = ["jieba", "lunar_python", "Pillow","aiohttp"]
 
 def install_dependencies():
     for pkg in DEPENDENCIES:
@@ -33,9 +33,8 @@ import zipfile
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
-from email import encoders
-from email.mime.text import MIMEText  # <--- 新增：修复邮箱报错
-import asyncio 
+from email.mime.text import MIMEText
+from email import encoders 
 import sqlite3
 import io
 import datetime
@@ -86,12 +85,18 @@ class MemeMaster(Star):
         self.current_summary = self.load_memory()
         self.img_hashes = {} 
         self.sessions = {} 
-        self.msg_count = 0 
+        self.round_count = 0
+        self.pending_user_msg = ""
+        self.rounds_since_sticky = 0
+        self.sticky_updated = False
+        self.config_mtime = os.path.getmtime(self.config_file) if os.path.exists(self.config_file) else 0
+
         
         self.is_summarizing = False
         self.last_auto_save_time = 0
         self.last_active_time = time.time()
-        
+        self.last_email_date = ""
+
         self.pair_map = {'“': '”', '《': '》', '（': '）', '(': ')', '"': '"', "'": "'"}
         self.split_chars = "\n。？！?!"
 
@@ -154,6 +159,8 @@ class MemeMaster(Star):
     async def save_message_to_db(self, content, msg_type='dialogue'):
         """v24: 异步锁 + 报错屏蔽"""
         if not content: return
+        if "AstrBot 请求失败" in content or "请在平台日志查看" in content:
+            return
         async with self.db_lock: # <--- 关键：拿锁
             try:
                 kw = self.extract_keywords(content)
@@ -268,55 +275,77 @@ class MemeMaster(Star):
                         count += 1
                     except: pass
             
-            # 2. 导入 memory.txt (智能切片)
+            # 2. 导入 memory.txt (按段落粒度切割)
             if legacy_memory and legacy_memory.strip():
-                import re
-                if "---" in legacy_memory:
-                    # 使用正则切分，保留分割线标题
-                    # 这个正则会匹配 --- 到下一个 --- 之间的内容
-                    pattern = r"(--- \d{4}-\d{2}-\d{2}.*?---)"
-                    parts = re.split(pattern, legacy_memory)
-                    
-                    fragments = []
-                    current_header = ""
-                    for p in parts:
-                        p = p.strip()
-                        if not p: continue
-                        if p.startswith("---") and p.endswith("---"):
-                            current_header = p # 记下日期头
-                        else:
-                            # 把日期头和具体内容拼在一起，形成一个完整的“记忆块”
-                            full_block = f"{current_header}\n{p}"
-                            fragments.append(full_block)
-                else:
-                    fragments = legacy_memory.split("\n\n")
-
-                for frag in fragments:
-                    content = frag.strip()
-                    if not content: continue
-                    kw = self.extract_keywords(content)
-                    try:
-                        c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'fragment', ?)",
-                                  (content, kw, time.time()))
-                    except: pass
-
-            conn.commit()
-            conn.close()
-            return True, "数据迁移成功：已按日期和段落完成智能切片"
-        except Exception as e:
-            return False, str(e)
+                current_date = ""
+                # 按行遍历，识别日期 + 按空行分段
+                paragraphs = []
+                current_para = []
                 
+                for line in legacy_memory.split("\n"):
+                    stripped = line.strip()
+                    
+                    # 识别 C格式日期: --- 2025-12-29 ... ---
+                    date_c = re.match(r"---\s*(\d{4}-\d{2}-\d{2}).*---", stripped)
+                    # 识别 B格式日期: 2025年12月16日 | 标题
+                    date_b = re.match(r"(\d{4}年\d{1,2}月\d{1,2}日)\s*[|｜]", stripped)
+                    # 识别编号标题: 1. xxx  2. xxx (A格式大总结)
+                    numbered = re.match(r"^\d+\.\s+", stripped)
+                    
+                    if date_c:
+                        # 遇到新日期，先保存之前的段落
+                        if current_para:
+                            paragraphs.append((current_date, "\n".join(current_para)))
+                            current_para = []
+                        current_date = date_c.group(1)
+                    elif date_b:
+                        if current_para:
+                            paragraphs.append((current_date, "\n".join(current_para)))
+                            current_para = []
+                        current_date = date_b.group(1)
+                        current_para.append(stripped)  # 标题行也保留
+                    elif numbered and len(current_para) > 2:
+                        # 编号标题且已有内容，分段
+                        paragraphs.append((current_date, "\n".join(current_para)))
+                        current_para = [stripped]
+                    elif stripped == "":
+                        # 空行 = 段落分隔（但要求当前段落至少有内容）
+                        if current_para:
+                            paragraphs.append((current_date, "\n".join(current_para)))
+                            current_para = []
+                    else:
+                        current_para.append(stripped)
+                
+                # 别忘了最后一段
+                if current_para:
+                    paragraphs.append((current_date, "\n".join(current_para)))
+                
+                # 存入数据库
+                for date_str, content in paragraphs:
+                    content = content.strip()
+                    if not content or len(content) < 5:
+                        continue  # 跳过太短的碎片
+                    # 有日期就加前缀
+                    full_content = f"{date_str} | {content}" if date_str else content
+                    kw = self.extract_keywords(full_content)
+                    c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'fragment', ?)",
+                              (full_content, kw, time.time()))
             # 3. 导入 buffer.json
             if legacy_buffer and isinstance(legacy_buffer, list):
                 for msg in legacy_buffer:
-                    self.save_message_to_db(str(msg), 'dialogue')
-                    
+                    msg_str = str(msg).strip()
+                    if msg_str and "AstrBot 请求失败" not in msg_str:
+                        kw = self.extract_keywords(msg_str)
+                        c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'dialogue', ?)",
+                                  (msg_str, kw, time.time()))
+
             conn.commit()
             conn.close()
-            return True, f"成功导入 {count} 张图片记录及相关记忆"
+            return True, f"成功导入 {count} 张图片 + 记忆 + 对话记录"
         except Exception as e:
             print(f"❌ [Meme] 数据迁移失败: {e}", flush=True)
             return False, str(e)
+
 
     def get_db_context(self, current_query=""):
         """v24: 只提取 Sticky + 强相关记忆 (非最近)"""
@@ -343,10 +372,18 @@ class MemeMaster(Star):
                         params.extend([f"%{w}%", f"%{w}%"])
                     
                     if conditions and params:
-                        # ★★★ 核心：只找 2 条最相关的旧记录 ★★★
-                        sql = f"SELECT content FROM memories WHERE type IN ('dialogue', 'fragment') AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 2"
-                        c.execute(sql, tuple(params))
-                        related_fragments = [f"【相关回忆】{row['content']}" for row in c.fetchall()]
+                        context_window = int(self.local_config.get("ab_context_rounds", 50))
+                        where_clause = ' OR '.join(conditions)
+                        
+                        # 拿 2 条相关总结 (fragment)
+                        sql_frag = f"SELECT content FROM memories WHERE type='fragment' AND ({where_clause}) ORDER BY created_at DESC LIMIT 2"
+                        c.execute(sql_frag, tuple(params))
+                        related_fragments = [f"【相关总结】{row['content']}" for row in c.fetchall()]
+                        
+                        # 拿 4 条相关原文 (dialogue)，跳过 AstrBot 自带的上下文
+                        sql_dial = f"SELECT content FROM memories WHERE type='dialogue' AND ({where_clause}) ORDER BY created_at DESC LIMIT 4 OFFSET {context_window}"
+                        c.execute(sql_dial, tuple(params))
+                        related_fragments += [f"【相关对话】{row['content']}" for row in c.fetchall()]
 
             conn.close()
             
@@ -421,6 +458,8 @@ class MemeMaster(Star):
             # 防抖逻辑
             try: debounce_time = float(self.local_config.get("debounce_time", 3.0))
             except: debounce_time = 3.0
+            print(f"🔧 [Meme] 防抖值: {debounce_time}", flush=True)  # ← 加这行
+
 
             if debounce_time > 0:
                 if uid in self.sessions:
@@ -476,9 +515,10 @@ class MemeMaster(Star):
             # 3. 检索记忆 (返回 stickies 列表 和 相关文本)
             stickies, related_context = self.get_db_context(msg_str)
             
-            # 4. Sticky 冷却注入逻辑
-            # 每 10 句才全量注入一次 Sticky，防止 Token 爆炸
-            if self.msg_count % 10 == 0 and stickies:
+            # 4. Sticky 冷却注入逻辑（频率由 ab_context_rounds 自动计算）
+            ab_rounds = int(self.local_config.get("ab_context_rounds", 50))
+            sticky_freq = ab_rounds if ab_rounds <= 20 else ab_rounds // 2
+            if self.round_count % sticky_freq == 0 and stickies:
                 sticky_str = " ".join([f"({s})" for s in stickies])
                 system_context.append(f"Important Facts: {sticky_str}")
 
@@ -493,10 +533,8 @@ class MemeMaster(Star):
                 hints_str = " ".join([f"<MEME:{t}>" for t in meme_hints])
                 system_context.append(f"Available Memes (Select Best): {hints_str}")
 
-            # 7. 计数 +1
-            self.msg_count += 1
 
-            # 8. 构造最终文本
+            # 7. 构造最终文本
             # AstrBot 自带最近几轮 Context，我们只补全它不知道的
             final_text = f"{msg_str}\n\n(System Context: {' | '.join(system_context)})"
             
@@ -540,18 +578,23 @@ class MemeMaster(Star):
                 print(f"📝 [Meme] AI 捕获重要事实: {mem_content}", flush=True)
                 # 存为 sticky 类型
                 await self.save_message_to_db(mem_content, 'sticky')
+                self.sticky_updated = True
             # 从回复给用户的文本里删掉这行指令，用户看不到
             text = text.replace(mem_match.group(0), "").strip()
 
         # 防应声虫：成对存库
         user_raw = getattr(event, "user_text_raw", "")
         ai_clean = re.sub(r"\(System Context:.*?\)", "", text).strip()
+        ai_clean = re.sub(r"<MEME:.*?>", "", ai_clean).strip()  # 也清掉 meme 标签
         
         if user_raw and ai_clean:
             pair_log = f"User: {user_raw}\nAI: {ai_clean}"
             self.chat_history_buffer.append(pair_log)
             self.save_buffer_to_disk()
             await self.save_message_to_db(pair_log, 'dialogue')
+            self.round_count += 1
+            self.rounds_since_sticky += 1
+
         
         if not self.is_summarizing:
             asyncio.create_task(self.check_and_summarize())
@@ -579,10 +622,9 @@ class MemeMaster(Star):
                     if clean_part: mixed_chain.append(Plain(clean_part))
             
             if not has_meme and len(text) < 50 and "\n" not in text:
-                # 如果刚才删了 [[MEM]] 导致文本变了，需要更新回去，否则 AstrBot 发的是旧的
-                if mem_match: 
-                    event.set_result(MessageChain([Plain(text)]))
+                event.set_result(MessageChain([Plain(text)]))
                 return
+
 
             segments = self.smart_split(mixed_chain)
             delay_base = self.local_config.get("delay_base", 0.5)
@@ -643,9 +685,9 @@ class MemeMaster(Star):
 
     def load_config(self):
         default = {
-            "web_port": 5000, "debounce_time": 3.0, "reply_prob": 50, 
-            "auto_save_cooldown": 60, "memory_interval": 20, 
-            "summary_threshold": 40, "proactive_interval": 0,
+            "web_port": 5000, "debounce_time": 3.0,
+            "auto_save_cooldown": 60, "ab_context_rounds": 50,
+            "proactive_interval": 0,
             "quiet_start": 23, "quiet_end": 7,
             "delay_base": 0.5, "delay_factor": 0.1,
             "web_token": "admin123", # 确保有默认token
@@ -685,11 +727,21 @@ class MemeMaster(Star):
                 if mtime > self.config_mtime:
                     print(f"🔄 [Meme] 配置文件热重载", flush=True)
                     self.local_config = self.load_config()
+                    self.config_mtime = mtime   # ← 加这行
             except: pass
             
     async def check_and_summarize(self):
         """v24: 纯粹的总结逻辑 (只生成 Fragment，不重复提取 Sticky)"""
-        threshold = self.local_config.get("summary_threshold", 40)
+        ab_rounds = int(self.local_config.get("ab_context_rounds", 50))
+        if ab_rounds <= 20:
+            threshold = ab_rounds
+            summary_words = 150
+        elif ab_rounds <= 50:
+            threshold = int(ab_rounds * 0.8)
+            summary_words = 300
+        else:
+            threshold = 50
+            summary_words = 400
         if len(self.chat_history_buffer) < threshold or self.is_summarizing: 
             return
         
@@ -697,18 +749,25 @@ class MemeMaster(Star):
         try:
             print(f"🧠 [Meme] 正在消化记忆 (积压: {len(self.chat_history_buffer)} 条)...", flush=True)
             now_str = self.get_full_time_str()
+            # 从 buffer 提取实际消息日期范围
+            first_msg = self.chat_history_buffer[0] if self.chat_history_buffer else ""
+            date_match = re.search(r'\d{4}-\d{2}-\d{2}', first_msg)
+            msg_date = date_match.group() if date_match else now_str.split(' ')[0]
             history_text = "\n".join(self.chat_history_buffer)
             
             provider = self.context.get_using_provider()
             if not provider: return
             
-            # 使用 1.txt 风格的简单提示词
             prompt = f"""当前时间：{now_str}
-                这是一段过去的对话记录。请将其总结为一段简练的“长期记忆”或“日记”。
-                重点记录：用户的喜好、发生的重要事件、双方约定的事情。
-                忽略：无意义的寒暄、重复的表情包指令。
-                字数限制：200字以内。
-                
+                这是一段过去的对话记录。请将其总结为简练的"长期记忆"。
+                【重要规则】如果对话跨越多天，必须按日期分段总结，格式如：
+                [2025-12-29] 发生了xxx
+                [2025-12-30] 发生了xxx
+                如果同一天则只写一个日期。
+                重点记录：用户的喜好、重要事件、双方约定。
+                忽略：无意义寒暄、重复表情包指令。
+                字数限制：{summary_words}字以内。请确保包含适量的细节关键词以便日后检索。
+
                 对话内容：
                 {history_text}"""
             
@@ -718,9 +777,16 @@ class MemeMaster(Star):
             summary = self.clean_markdown(summary)
             
             if summary:
-                # 加上时间戳标题，存为片段
-                full_summary = f"--- {now_str} 总结 ---\n{summary}"
-                await self.save_message_to_db(full_summary, 'fragment')
+                # 按行分段存储，每段独立一条 fragment，方便精准检索
+                lines = summary.split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if not line or len(line) < 5:
+                        continue
+                    # 如果这行没有日期前缀，加上日期
+                    if not re.match(r"\[?\d{4}", line):
+                        line = f"[{msg_date}] {line}"
+                    await self.save_message_to_db(line, 'fragment')
                 
                 # 清空 buffer
                 self.chat_history_buffer = [] 
@@ -753,7 +819,7 @@ class MemeMaster(Star):
                 
                 conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
                 c = conn.cursor()
-                c.execute("SELECT filename FROM memes WHERE feature_hash = ?", (current_hash,))
+                c.execute("SELECT filename FROM memes WHERE feature_hash = ? AND feature_hash != ''", (current_hash,))
                 exists = c.fetchone()
                 conn.close()
                 
@@ -776,7 +842,7 @@ class MemeMaster(Star):
                 
                 # 4. 处理 AI 回复
                 if "YES" in content:
-                    match = re.search(r"<(?P<tag>.*?)>[:：]?(?P<desc>.*)", content)
+                    match = re.search(r"<?(?P<tag>[^>\n:：]+)>?[:：]\s*(?P<desc>.*)", content)
                     if match:
                         full_tag = f"{match.group('tag').strip()}: {match.group('desc').strip()}"
                         print(f"🖤 [自动进货] 识图成功: {full_tag}")
@@ -812,7 +878,17 @@ class MemeMaster(Star):
 
     async def _lonely_watcher(self):
         while self.running: 
-            await asyncio.sleep(60) 
+            await asyncio.sleep(60)
+            today = datetime.datetime.now().strftime('%Y-%m-%d')
+            hour = datetime.datetime.now().hour
+            if hour == 5 and today != self.last_email_date:
+                if self.local_config.get("smtp_host"):
+                    try:
+                        await self.send_backup_email()
+                        self.last_email_date = today
+                        print("📧 [Meme] 每日备份邮件已发送", flush=True)
+                    except: pass
+ 
             self.check_config_reload()
             
             interval = self.local_config.get("proactive_interval", 0)
@@ -838,7 +914,17 @@ class MemeMaster(Star):
                         print(f"👋 [Meme] 主动发起聊天...", flush=True)
                         
                         # ★★★ 1. 获取最近聊天记录，作为上下文 ★★★
-                        recent_log = "\n".join(self.chat_history_buffer[-10:])
+                        # 从DB读最近10条对话
+                        try:
+                            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+                            c = conn.cursor()
+                            c.execute("SELECT content FROM memories WHERE type='dialogue' ORDER BY created_at DESC LIMIT 10")
+                            rows = c.fetchall()
+                            conn.close()
+                            recent_log = "\n".join([r[0] for r in reversed(rows)])
+                        except:
+                            recent_log = ""
+
                         
                         # ★★★ 2. 导演式 Prompt，防止出戏 ★★★
                         prompt = f"""[System Instruction]
@@ -968,23 +1054,29 @@ class MemeMaster(Star):
         # 1. 尝试直接查库
         conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
         c = conn.cursor()
-        # 精确或模糊搜索
         c.execute("SELECT filename FROM memes WHERE tags LIKE ? LIMIT 1", (f"%{query}%",))
         row = c.fetchone()
         conn.close()
-        
+    
         if row:
             return os.path.join(self.img_dir, row[0])
-            
-        # 2. 如果库里没查到 (兼容旧逻辑)，再遍历一下 self.data (如果有的话)
+        
+        # 2. 如果库里没查到，再遍历 self.data
+        threshold = float(self.local_config.get("meme_match_threshold", 0.3))  # ← 改动A：读配置
         best, score = None, 0
         for f, i in self.data.items():
             t = i.get("tags", "")
             if query in t: return os.path.join(self.img_dir, f)
-            s = difflib.SequenceMatcher(None, query, t.split(":")[0]).ratio()
+            name = t.split(":")[0] if ":" in t else t          # ← 改动B：拆出名字
+            desc = t.split(":")[-1] if ":" in t else ""        # ← 拆出描述
+            s = max(                                            # ← 改动C：两个都比
+                difflib.SequenceMatcher(None, query, name).ratio(),
+                difflib.SequenceMatcher(None, query, desc).ratio()
+            )
             if s > score: score = s; best = f
-        if score > 0.4: return os.path.join(self.img_dir, best)
+        if score >= threshold: return os.path.join(self.img_dir, best)  # ← 0.4 改成 threshold
         return None
+
     
     def save_config(self): 
         try: json.dump(self.local_config, open(self.config_file,"w"), indent=2)
@@ -1032,6 +1124,7 @@ class MemeMaster(Star):
         app.router.add_get("/get_stickies", self.h_get_stickies) # <--- 新加
         app.router.add_post("/update_sticky", self.h_update_sticky) # <--- 新加
         app.router.add_static("/images/", path=self.img_dir)
+        app.router.add_get("/meme_count", self.h_meme_count)
         runner = web.AppRunner(app)
         await runner.setup()
         port = self.local_config.get("web_port", 5000)
@@ -1039,12 +1132,6 @@ class MemeMaster(Star):
         await site.start()
         print(f"🌐 [Meme] WebUI 管理后台已启动: http://localhost:{port}", flush=True)
 
-    async def h_idx(self,r): 
-        if not self.check_auth(r): return web.Response(status=403, text="Need ?token=xxx")
-        token = self.local_config["web_token"]
-        html = self.read_file("index.html").replace("{{MEME_DATA}}", json.dumps(self.data)).replace("admin123", token)
-        return web.Response(text=html, content_type="text/html")
-    # === WebUI 接口修正 (适配 SQLite) ===
 
     async def h_up(self, r):
         """上传接口：直接写入 SQLite"""
@@ -1130,7 +1217,9 @@ class MemeMaster(Star):
         token = self.local_config["web_token"]
         html = self.read_file("index.html").replace("{{MEME_DATA}}", json.dumps(data_for_web)).replace("admin123", token)
         return web.Response(text=html, content_type="text/html")
-    async def h_gcf(self,r): return web.json_response(self.local_config)
+    async def h_gcf(self,r):
+        if not self.check_auth(r): return web.Response(status=403)
+        return web.json_response(self.local_config)
 
     async def h_ucf(self, r):
         if not self.check_auth(r): return web.Response(status=403)
@@ -1180,6 +1269,9 @@ class MemeMaster(Star):
             self.data = self.load_data()
             self.local_config = self.load_config()
             self.chat_history_buffer = self.load_buffer_from_disk()
+            self.config_mtime = os.path.getmtime(self.config_file) if os.path.exists(self.config_file) else 0
+            self.round_count = 0
+            self.init_db()
             return web.Response(text="ok")
         except Exception as e:
             return web.Response(status=500, text=str(e))
@@ -1278,6 +1370,14 @@ class MemeMaster(Star):
         if not self.check_auth(r): return web.Response(status=403)
         res = await self.send_backup_email()
         return web.Response(text=res)
+
+    async def h_meme_count(self, r):
+        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM memes")
+        count = c.fetchone()[0]
+        conn.close()
+        return web.json_response({"count": count})
 
     async def send_backup_email(self):
         conf = self.local_config

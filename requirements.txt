@@ -1,1 +1,5 @@
-pip install jieba aiosmtplib lunar_python
+jieba
+aiosmtplib
+lunar_python
+aiohttp
+python-dotenv
