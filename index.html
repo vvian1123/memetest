@@ -712,7 +712,7 @@
 
         function init() { process(); render(); }
         function process() {
-            let list = Object.entries(rawData).reverse();
+            let list = Object.entries(rawData);
             if (state.filter !== 'all') list = list.filter(x => (x[1].source || 'manual') === state.filter);
             if (state.search) list = list.filter(x => (x[1].tags || "").toLowerCase().includes(state.search.toLowerCase()));
             state.items = list; state.page = 1; updatePage();

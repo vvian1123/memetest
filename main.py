@@ -456,6 +456,9 @@ class MemeMaster(Star):
                 return 
             
             # 防抖逻辑
+            # "/" 开头的命令跳过防抖，直接放行
+            if msg_str.startswith("/"):
+                return
             try: debounce_time = float(self.local_config.get("debounce_time", 3.0))
             except: debounce_time = 3.0
             print(f"🔧 [Meme] 防抖值: {debounce_time}", flush=True)  # ← 加这行
@@ -1345,6 +1348,7 @@ class MemeMaster(Star):
                     c.execute("UPDATE memories SET content=? WHERE id=? AND type='sticky'", (content, mid))
             
             conn.commit()
+            self.round_count = 0  # 让 Sticky 在下一轮立即注入
             return web.Response(text="ok")
         except Exception as e:
             return web.Response(status=500, text=str(e))
