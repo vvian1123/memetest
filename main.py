@@ -552,6 +552,9 @@ class MemeMaster(Star):
 
             system_tag += "</system_context>"
 
+            # === DEBUG 2: 看最终拼出来的 system_tag ===
+            print(f"🔍 [Sticky Debug 2] system_tag前200字: {system_tag[:200]}", flush=True)
+
             # 7. 构造最终文本
             # 使用 XML 标签包裹系统上下文，让 AI 清晰区分 System 和 User
             final_text = f"{msg_str}\n\n{system_tag}"
