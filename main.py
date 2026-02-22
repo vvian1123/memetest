@@ -527,6 +527,12 @@ class MemeMaster(Star):
             # 4. Sticky 冷却注入逻辑（频率由 ab_context_rounds 自动计算）
             ab_rounds = int(self.local_config.get("ab_context_rounds", 50))
             sticky_freq = ab_rounds if ab_rounds <= 20 else ab_rounds // 2
+            
+            # === DEBUG: 排查 Sticky 注入问题 ===
+            print(f"🔍 [Sticky Debug] round_count={self.round_count}, sticky_freq={sticky_freq}, "
+                  f"stickies数量={len(stickies)}, 条件={self.round_count % sticky_freq == 0}, "
+                  f"内容={stickies[:2] if stickies else '空'}", flush=True)
+            
             if self.round_count % sticky_freq == 0 and stickies:
                 sticky_str = " ".join([f"({s})" for s in stickies])
                 system_tag += f"Important Facts (Established Knowledge): {sticky_str}\n"
