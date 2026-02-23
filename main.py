@@ -85,10 +85,9 @@ class MemeMaster(Star):
         self.current_summary = self.load_memory()
         self.img_hashes = {} 
         self.sessions = {} 
-        self.round_count = 0
+        # round_count 和 sticky_updated 从 DB 读取，不再用实例变量
         self.pending_user_msg = ""
         self.rounds_since_sticky = 0
-        self.sticky_updated = False
         self.config_mtime = os.path.getmtime(self.config_file) if os.path.exists(self.config_file) else 0
 
         
@@ -147,6 +146,29 @@ class MemeMaster(Star):
         conn.commit()
         conn.close()
         print("✅ [Meme] 数据库 v2.0 初始化完成 (索引已建立)", flush=True)
+
+    def _get_config_val(self, key, default="0"):
+        """从 system_config 表读取状态值"""
+        try:
+            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"), timeout=5)
+            c = conn.cursor()
+            c.execute("SELECT value FROM system_config WHERE key=?", (key,))
+            row = c.fetchone()
+            conn.close()
+            return row[0] if row else default
+        except:
+            return default
+
+    def _set_config_val(self, key, value):
+        """写入 system_config 表"""
+        try:
+            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"), timeout=5)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)", (key, str(value)))
+            conn.commit()
+            conn.close()
+        except:
+            pass
 
 
     def extract_keywords(self, text):
@@ -366,30 +388,33 @@ class MemeMaster(Star):
 
             related_fragments = []
             
-            # 2. 相关性检索：用户说什么，去库里找最匹配的 2 段 (可能是很久以前的)
+            # 2. 相关性检索：评分制，按关键词命中数排序
             if current_query:
                 # 提取关键词
                 query_words = [w for w in jieba.cut_for_search(current_query) if len(w) > 1]
                 if query_words:
-                    conditions = []
-                    params = []
+                    # 构建评分表达式：每命中一个关键词 +1 分
+                    score_parts = []
+                    params_score = []
                     for w in query_words:
-                        conditions.append("(keywords LIKE ? OR content LIKE ?)")
-                        params.extend([f"%{w}%", f"%{w}%"])
+                        score_parts.append("(CASE WHEN keywords LIKE ? OR content LIKE ? THEN 1 ELSE 0 END)")
+                        params_score.extend([f"%{w}%", f"%{w}%"])
+                    score_expr = " + ".join(score_parts)
                     
-                    if conditions and params:
-                        context_window = int(self.local_config.get("ab_context_rounds", 50))
-                        where_clause = ' OR '.join(conditions)
-                        
-                        # 拿 2 条相关总结 (fragment)
-                        sql_frag = f"SELECT content FROM memories WHERE type='fragment' AND ({where_clause}) ORDER BY created_at DESC LIMIT 2"
-                        c.execute(sql_frag, tuple(params))
-                        related_fragments = [f"【相关总结】{row['content']}" for row in c.fetchall()]
-                        
-                        # 拿 4 条相关原文 (dialogue)，跳过 AstrBot 自带的上下文
-                        sql_dial = f"SELECT content FROM memories WHERE type='dialogue' AND ({where_clause}) ORDER BY created_at DESC LIMIT 4 OFFSET {context_window}"
-                        c.execute(sql_dial, tuple(params))
-                        related_fragments += [f"【相关对话】{row['content']}" for row in c.fetchall()]
+                    # 最低匹配要求：多关键词至少命中2个，单关键词命中1个
+                    min_score = 2 if len(query_words) >= 2 else 1
+                    
+                    context_window = int(self.local_config.get("ab_context_rounds", 50))
+                    
+                    # 拿 2 条相关总结 (fragment)，按评分排序
+                    sql_frag = f"SELECT content, ({score_expr}) as score FROM memories WHERE type='fragment' AND ({score_expr}) >= {min_score} ORDER BY score DESC, created_at DESC LIMIT 2"
+                    c.execute(sql_frag, tuple(params_score * 2))
+                    related_fragments = [f"【相关总结】{row['content']}" for row in c.fetchall()]
+                    
+                    # 拿 4 条相关原文 (dialogue)，跳过 AstrBot 自带的上下文
+                    sql_dial = f"SELECT content, ({score_expr}) as score FROM memories WHERE type='dialogue' AND ({score_expr}) >= {min_score} ORDER BY score DESC, created_at DESC LIMIT 4 OFFSET {context_window}"
+                    c.execute(sql_dial, tuple(params_score * 2))
+                    related_fragments += [f"【相关对话】{row['content']}" for row in c.fetchall()]
 
             conn.close()
             
@@ -519,26 +544,32 @@ class MemeMaster(Star):
 
             # 2. 准备 System Context
             time_info = self.get_full_time_str()
-            system_tag = f"<system_context>\nTime: {time_info}\n"
             
             # 3. 检索记忆 (异步执行，防止阻塞)
             stickies, related_context = await asyncio.to_thread(self.get_db_context, msg_str)
             
-            # 4. Sticky 冷却注入逻辑（频率由 ab_context_rounds 自动计算）
+            # 4. Sticky 注入逻辑（频率由 ab_context_rounds 自动计算）
             ab_rounds = int(self.local_config.get("ab_context_rounds", 50))
             sticky_freq = ab_rounds if ab_rounds <= 20 else ab_rounds // 2
             
-            # === DEBUG: 排查 Sticky 注入问题 ===
-            print(f"🔍 [Sticky Debug] round_count={self.round_count}, sticky_freq={sticky_freq}, "
-                  f"stickies数量={len(stickies)}, 条件={self.round_count % sticky_freq == 0}, "
+            # === Sticky 注入 (状态从 DB 读取) ===
+            round_count = int(self._get_config_val("round_count", "0"))
+            sticky_flag = self._get_config_val("sticky_updated", "0") == "1"
+            should_inject = (round_count % sticky_freq == 0) or sticky_flag
+            print(f"🔍 [Sticky Debug] round_count={round_count}, sticky_freq={sticky_freq}, "
+                  f"stickies数量={len(stickies)}, 条件={should_inject}, "
+                  f"sticky_flag={sticky_flag}, "
                   f"内容={stickies[:2] if stickies else '空'}", flush=True)
             
-            if self.round_count % sticky_freq == 0 and stickies:
+            # 5. 组装 system_tag (顺序: Sticky → 回忆 → 表情包)
+            system_tag = "<system_context>\n"
+            
+            if should_inject and stickies:
                 sticky_str = " ".join([f"({s})" for s in stickies])
                 system_tag += f"Important Facts (Established Knowledge): {sticky_str}\n"
                 system_tag += "(NOTE: You already KNOW these facts. Do NOT repeat them in your response unless asked.)\n"
+                self._set_config_val("sticky_updated", "0")  # 重置标记
 
-            # 5. 注入相关回忆 (如果有)
             if related_context:
                 system_tag += f"Historical Context (Recall): {related_context}\n"
                 system_tag += "(NOTE: The above 'Historical Context' is for background info ONLY. Do NOT reply to it as if it marks the current conversation state.)\n"
@@ -546,18 +577,17 @@ class MemeMaster(Star):
             # 6. 智能检索表情包 (异步执行)
             meme_hints = await asyncio.to_thread(self.get_meme_candidates, msg_str)
             if meme_hints:
-                # 提示 AI 有这些图可选
                 hints_str = " ".join([f"<MEME:{t}>" for t in meme_hints])
                 system_tag += f"Available Memes (Random/Select): {hints_str}\n"
 
+            system_tag += f"Time: {time_info}\n"
             system_tag += "</system_context>"
 
             # === DEBUG 2: 看最终拼出来的 system_tag ===
             print(f"🔍 [Sticky Debug 2] system_tag前200字: {system_tag[:200]}", flush=True)
 
-            # 7. 构造最终文本
-            # 使用 XML 标签包裹系统上下文，让 AI 清晰区分 System 和 User
-            final_text = f"{msg_str}\n\n{system_tag}"
+            # 7. 构造最终文本 (system_context 在前, 用户消息在后)
+            final_text = f"{system_tag}\n\n{msg_str}"
             
             event.message_str = final_text
             chain = [Plain(final_text)]
@@ -589,6 +619,10 @@ class MemeMaster(Star):
         if not text: return
         setattr(event, "__meme_processed", True)
         
+        # === DEBUG 3: 看 on_output 收到的原始文本 ===
+        has_meme_tag = "<MEME:" in text or "MEME_TAG:" in text
+        print(f"🔍 [Meme Debug] 有标签={has_meme_tag}, 原文前150字: {text[:150]}", flush=True)
+        
         text = self.clean_markdown(text)
         
         # 如果 AI 输出了 [[MEM:生日是5.20]]，立刻拦截并存入 Sticky
@@ -616,7 +650,8 @@ class MemeMaster(Star):
             self.chat_history_buffer.append(pair_log)
             self.save_buffer_to_disk()
             await self.save_message_to_db(pair_log, 'dialogue')
-            self.round_count += 1
+            new_rc = int(self._get_config_val("round_count", "0")) + 1
+            self._set_config_val("round_count", str(new_rc))
             self.rounds_since_sticky += 1
 
         
@@ -624,15 +659,17 @@ class MemeMaster(Star):
             asyncio.create_task(self.check_and_summarize())
 
         try:
-            # 表情包解析 (和之前一样)
-            pattern = r"(<MEME:.*?>|MEME_TAG:\s*[\S]+)"
+            # 表情包解析 (兼容反引号包裹)
+            pattern = r"(`?<MEME:.*?>`?|MEME_TAG:\s*[\S]+)"
             parts = re.split(pattern, text)
             mixed_chain = []
             has_meme = False
             
             for part in parts:
                 tag = None
-                if part.startswith("<MEME:"): tag = part[6:-1].strip()
+                # 兼容 `<MEME:xxx>` 和 <MEME:xxx> 两种格式
+                clean_part_meme = part.strip("`")
+                if clean_part_meme.startswith("<MEME:"): tag = clean_part_meme[6:-1].strip()
                 elif "MEME_TAG:" in part: tag = part.replace("MEME_TAG:", "").strip()
                 
                 if tag:
@@ -674,6 +711,9 @@ class MemeMaster(Star):
         text = text.replace("**", "")
         text = text.replace("### ", "").replace("## ", "")
         if text.startswith("> "): text = text[2:]
+        # 去掉 AI 用反引号包裹 MEME 标签的情况: `<MEME:xxx>` → <MEME:xxx>
+        text = re.sub(r"`(<MEME:.*?>)`", r"\1", text)
+        text = re.sub(r"`(MEME_TAG:\s*\S+)`", r"\1", text)
         return text.strip()
 
     def smart_split(self, chain):
@@ -1369,7 +1409,8 @@ class MemeMaster(Star):
                     c.execute("UPDATE memories SET content=? WHERE id=? AND type='sticky'", (content, mid))
             
             conn.commit()
-            self.round_count = 0  # 让 Sticky 在下一轮立即注入
+            self._set_config_val("round_count", "0")  # 计数清零
+            self._set_config_val("sticky_updated", "1")  # 标记有更新，强制下一轮注入
             return web.Response(text="ok")
         except Exception as e:
             return web.Response(status=500, text=str(e))
