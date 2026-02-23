@@ -552,13 +552,16 @@ class MemeMaster(Star):
             ab_rounds = int(self.local_config.get("ab_context_rounds", 50))
             sticky_freq = ab_rounds if ab_rounds <= 20 else ab_rounds // 2
             
-            # === Sticky 注入 (状态从 DB 读取) ===
+            # === Sticky 变更检测 (用内容 hash，不依赖 h_update_sticky 写标记) ===
             round_count = int(self._get_config_val("round_count", "0"))
-            sticky_flag = self._get_config_val("sticky_updated", "0") == "1"
-            should_inject = (round_count % sticky_freq == 0) or sticky_flag
+            current_hash = str(hash(tuple(sorted(stickies)))) if stickies else "empty"
+            stored_hash = self._get_config_val("sticky_hash", "")
+            sticky_changed = (current_hash != stored_hash) and stickies
+            should_inject = (round_count % sticky_freq == 0) or sticky_changed
+            
             print(f"🔍 [Sticky Debug] round_count={round_count}, sticky_freq={sticky_freq}, "
                   f"stickies数量={len(stickies)}, 条件={should_inject}, "
-                  f"sticky_flag={sticky_flag}, "
+                  f"内容变更={sticky_changed}, "
                   f"内容={stickies[:2] if stickies else '空'}", flush=True)
             
             # 5. 组装 system_tag (顺序: Sticky → 回忆 → 表情包)
@@ -568,7 +571,10 @@ class MemeMaster(Star):
                 sticky_str = " ".join([f"({s})" for s in stickies])
                 system_tag += f"Important Facts (Established Knowledge): {sticky_str}\n"
                 system_tag += "(NOTE: You already KNOW these facts. Do NOT repeat them in your response unless asked.)\n"
-                self._set_config_val("sticky_updated", "0")  # 重置标记
+                # 更新 hash + 重置计数
+                self._set_config_val("sticky_hash", current_hash)
+                if sticky_changed:
+                    self._set_config_val("round_count", "0")
 
             if related_context:
                 system_tag += f"Historical Context (Recall): {related_context}\n"
