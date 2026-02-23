@@ -167,8 +167,8 @@ class MemeMaster(Star):
             c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)", (key, str(value)))
             conn.commit()
             conn.close()
-        except:
-            pass
+        except Exception as e:
+            print(f"❌ [Config] 写入失败 key={key}: {e}", flush=True)
 
 
     def extract_keywords(self, text):
@@ -388,10 +388,10 @@ class MemeMaster(Star):
 
             related_fragments = []
             
-            # 2. 相关性检索：评分制，按关键词命中数排序
+            # 2. 相关性检索：用 TF-IDF 提取关键词，评分制匹配
             if current_query:
-                # 提取关键词
-                query_words = [w for w in jieba.cut_for_search(current_query) if len(w) > 1]
+                # 用 extract_tags (TF-IDF) 提取有区分度的关键词
+                query_words = [w for w in jieba.analyse.extract_tags(current_query, topK=5) if len(w) > 1]
                 if query_words:
                     # 构建评分表达式：每命中一个关键词 +1 分
                     score_parts = []
@@ -411,8 +411,8 @@ class MemeMaster(Star):
                     c.execute(sql_frag, tuple(params_score * 2))
                     related_fragments = [f"【相关总结】{row['content']}" for row in c.fetchall()]
                     
-                    # 拿 4 条相关原文 (dialogue)，跳过 AstrBot 自带的上下文
-                    sql_dial = f"SELECT content, ({score_expr}) as score FROM memories WHERE type='dialogue' AND ({score_expr}) >= {min_score} ORDER BY score DESC, created_at DESC LIMIT 4 OFFSET {context_window}"
+                    # 拿 4 条相关原文 (dialogue)，按时间排序+跳过AB上下文，评分仅做筛选
+                    sql_dial = f"SELECT content, ({score_expr}) as score FROM memories WHERE type='dialogue' AND ({score_expr}) >= {min_score} ORDER BY created_at DESC LIMIT 4 OFFSET {context_window}"
                     c.execute(sql_dial, tuple(params_score * 2))
                     related_fragments += [f"【相关对话】{row['content']}" for row in c.fetchall()]
 
@@ -578,7 +578,7 @@ class MemeMaster(Star):
             meme_hints = await asyncio.to_thread(self.get_meme_candidates, msg_str)
             if meme_hints:
                 hints_str = " ".join([f"<MEME:{t}>" for t in meme_hints])
-                system_tag += f"Available Memes (Random/Select): {hints_str}\n"
+                system_tag += f"Available Memes (copy EXACT tag to use): {hints_str}\n"
 
             system_tag += f"Time: {time_info}\n"
             system_tag += "</system_context>"
@@ -1123,6 +1123,7 @@ class MemeMaster(Star):
         conn.close()
     
         if row:
+            print(f"🔍 [Meme Match] DB精确命中: query='{query}' → {row[0]}", flush=True)
             return os.path.join(self.img_dir, row[0])
         
         # 2. 如果库里没查到，再遍历 self.data
@@ -1130,7 +1131,9 @@ class MemeMaster(Star):
         best, score = None, 0
         for f, i in self.data.items():
             t = i.get("tags", "")
-            if query in t: return os.path.join(self.img_dir, f)
+            if query in t:
+                print(f"🔍 [Meme Match] data精确命中: query='{query}' → {f}", flush=True)
+                return os.path.join(self.img_dir, f)
             name = t.split(":")[0] if ":" in t else t          # ← 改动B：拆出名字
             desc = t.split(":")[-1] if ":" in t else ""        # ← 拆出描述
             s = max(                                            # ← 改动C：两个都比
@@ -1138,6 +1141,8 @@ class MemeMaster(Star):
                 difflib.SequenceMatcher(None, query, desc).ratio()
             )
             if s > score: score = s; best = f
+        
+        print(f"🔍 [Meme Match] 模糊匹配: query='{query}', 最佳={best}, 分数={score:.2f}, 阈值={threshold}", flush=True)
         if score >= threshold: return os.path.join(self.img_dir, best)  # ← 0.4 改成 threshold
         return None
 
@@ -1409,8 +1414,11 @@ class MemeMaster(Star):
                     c.execute("UPDATE memories SET content=? WHERE id=? AND type='sticky'", (content, mid))
             
             conn.commit()
-            self._set_config_val("round_count", "0")  # 计数清零
-            self._set_config_val("sticky_updated", "1")  # 标记有更新，强制下一轮注入
+            # 用同一个连接写 config，避免新连接锁冲突
+            c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('round_count', '0')")
+            c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('sticky_updated', '1')")
+            conn.commit()
+            print(f"🔍 [Sticky] WebUI更新，已设置 sticky_updated=1, round_count=0", flush=True)
             return web.Response(text="ok")
         except Exception as e:
             return web.Response(status=500, text=str(e))
