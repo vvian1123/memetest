@@ -677,6 +677,15 @@
                     <input type="number" id="conf_delay_factor">
                     <div class="hint">每增加1个字符，额外延迟多少秒（推荐 0.05~0.2）</div>
                 </div>
+                <div class="form-group" style="display:flex; align-items:center; gap:12px;">
+                    <label style="margin:0;">⌨️ 输入状态智能防抖</label>
+                    <select id="conf_typing_debounce"
+                        style="padding:8px 14px; border:2px solid #e2e8f0; border-radius:12px; font-size:0.9rem; background:#fff;">
+                        <option value="off">关闭</option>
+                        <option value="on">开启</option>
+                    </select>
+                    <div class="hint" style="margin:0; font-size:0.8rem;">仅限 Napcat。开启后对方还在打字时机器人会继续等待。</div>
+                </div>
                 <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
                 <div class="form-group">
                     <label>AstrBot 上下文轮数</label>
@@ -935,7 +944,7 @@
                 const c = await res.json();
                 const keys = ['auto_save_cooldown', 'debounce_time', 'delay_base', 'delay_factor',
                     'ab_context_rounds', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token',
-                    'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id'];
+                    'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id', 'typing_debounce'];
                 keys.forEach(k => {
                     const el = document.getElementById(`conf_${k}`);
                     if (el) {
@@ -962,7 +971,7 @@
                 const el = document.getElementById(`conf_${k}`);
                 if (el) {
                     const val = el.value.trim();
-                    if (['web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id'].includes(k)) {
+                    if (['web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id', 'typing_debounce'].includes(k)) {
                         conf[k] = val;
                     } else {
                         // 数字字段：如果是空字符串就不传，或者传 0

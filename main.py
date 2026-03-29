@@ -432,11 +432,27 @@ class MemeMaster(Star):
         self.running = False 
 
     async def _debounce_timer(self, uid: str, duration: float):
+        """防抖计时器: 支持正在输入延长"""
         try:
             await asyncio.sleep(duration)
-            if uid in self.sessions: 
+            # 智能延长: 仅在启用输入检测时生效
+            if self.local_config.get("typing_debounce", "off").strip().lower() in ["on", "1", "true", "开"]:
+                typing_times = getattr(self, '_typing_times', {})
+                user_id = uid.split(':')[-1] if ':' in uid else uid
+                max_extra_wait = 30
+                waited = 0
+                while waited < max_extra_wait:
+                    last_type = typing_times.get(user_id, 0)
+                    if time.time() - last_type < 3.0:
+                        print(f"⌨️ [Debounce] 用户还在输入，继续等待...", flush=True)
+                        await asyncio.sleep(2.0)
+                        waited += 2
+                    else:
+                        break
+            if uid in self.sessions:
                 self.sessions[uid]['flush_event'].set()
-        except asyncio.CancelledError: pass
+        except asyncio.CancelledError:
+            pass
 
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=1)
     async def handle_private(self, event: AstrMessageEvent):
@@ -447,14 +463,23 @@ class MemeMaster(Star):
     # async def handle_group(self, event: AstrMessageEvent):
     #     await self._master_handler(event)
 
-    # === 探测器: 检测 AstrBot 是否转发 Notice 事件 ===
+    # === 正在输入检测: 延长防抖 ===
     @filter.event_message_type(EventMessageType.ALL, priority=99)
-    async def notice_probe(self, event: AstrMessageEvent):
+    async def notice_handler(self, event: AstrMessageEvent):
         try:
+            # 未开启则跳过
+            if self.local_config.get("typing_debounce", "off").strip().lower() not in ["on", "1", "true", "开"]:
+                return
             raw = getattr(event.message_obj, 'raw_message', None)
-            if isinstance(raw, dict) and raw.get("post_type") == "notice":
-                print(f"🔔 [Notice Probe] 捕获到 notice 事件! type={raw.get('notice_type')}, sub={raw.get('sub_type')}, user={raw.get('user_id')}", flush=True)
-                print(f"🔔 [Notice Probe] 完整数据: {raw}", flush=True)
+            if not isinstance(raw, dict) or raw.get('post_type') != 'notice':
+                return
+            if raw.get('notice_type') == 'notify' and raw.get('sub_type') == 'input_status':
+                uid = str(raw.get('user_id', ''))
+                if uid:
+                    if not hasattr(self, '_typing_times'):
+                        self._typing_times = {}
+                    self._typing_times[uid] = time.time()
+                    print(f"⌨️ [Typing] 用户 {uid} 正在输入", flush=True)
         except Exception:
             pass
 
@@ -499,27 +524,27 @@ class MemeMaster(Star):
                         # 传入 msg_str 作为上下文！
                         asyncio.create_task(self.ai_evaluate_image(url, msg_str))
 
-            # === /撤回 命令：删除最后一组对话 + 取消防抖 ===
+            # === /撤回 命令：撤回刚刚输入的一句话 ===
             if msg_str in ["/撤回", "/undo"]:
-                try:
-                    conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-                    c = conn.cursor()
-                    c.execute("SELECT id FROM memories WHERE type='dialogue' ORDER BY created_at DESC LIMIT 2")
-                    ids = [row[0] for row in c.fetchall()]
-                    if ids:
-                        placeholders = ",".join(["?"] * len(ids))
-                        c.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", ids)
-                        conn.commit()
-                        print(f"🗑️ [Meme] 撤回: 删除了 {len(ids)} 条对话记录 (ids={ids})", flush=True)
-                    conn.close()
-                except Exception as e:
-                    print(f"❌ [Meme] 撤回失败: {e}", flush=True)
-                # 取消防抖中的待发消息
-                if uid in self.sessions:
-                    self.sessions[uid]['queue'].clear()
-                    self.sessions[uid]['flush_event'].set()
+                has_pending = False
+                recalled_content = ""
+                if uid in self.sessions and self.sessions[uid]['queue']:
+                    has_pending = True
+                    # 只移除队列里的最后一条消息
+                    last_item = self.sessions[uid]['queue'].pop()
+                    recalled_content = last_item.get('content', '[图片]') if last_item.get('type') == 'text' else '[图片]'
+                    
+                    # 如果撤回后队列空了，说明全撤回了，取消本次 AI 请求
+                    if not self.sessions[uid]['queue']:
+                        self.sessions[uid]['flush_event'].set()
+
                 setattr(event, "__meme_skipped", True)
-                event.set_result(MessageEventResult().message("✅ 已遗忘上一句对话"))
+                if has_pending:
+                    msg = f"✅ 已撤回: {recalled_content}"
+                else:
+                    msg = "⚠️ 当前没有正在输入的待发消息可以撤回"
+                event.set_result(MessageEventResult().message(msg))
+                event.stop_event()
                 return
 
             # 指令穿透: 其他命令消息不走我们的处理流程
@@ -565,10 +590,14 @@ class MemeMaster(Star):
                 
                 await flush_event.wait()
                 
-                if uid not in self.sessions: return 
+                if uid not in self.sessions: 
+                    event.stop_event()
+                    return 
                 s = self.sessions.pop(uid)
                 queue = s['queue']
-                if not queue: return
+                if not queue: 
+                    event.stop_event()
+                    return
 
                 combined_text_list = []
                 combined_images = []
@@ -584,6 +613,8 @@ class MemeMaster(Star):
             # 1. 【防应声虫】：绝对不在这里 save_message_to_db (User)！
             # 我们把用户的话暂存在 event 对象里，传给 on_output
             event.user_text_raw = msg_str 
+            if img_urls:
+                setattr(event, "user_has_image", True)
 
             # 2. 准备 System Context
             time_info = self.get_full_time_str()
@@ -688,6 +719,9 @@ class MemeMaster(Star):
 
         # 防应声虫：成对存库
         user_raw = getattr(event, "user_text_raw", "")
+        if getattr(event, "user_has_image", False):
+            user_raw += " [图片]"
+        user_raw = user_raw.strip()
         
         # 清理掉 System Context (兼容旧版和新 XML 版)
         ai_clean = re.sub(r"\(System Context:.*?\)", "", text).strip()
@@ -988,6 +1022,8 @@ class MemeMaster(Star):
             except Exception as e:
                 # 打印所有未预见的异常
                 print(f"❌ [自动进货] 识图任务执行出错: {e}")
+
+
 
     async def _lonely_watcher(self):
         while self.running: 
