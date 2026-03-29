@@ -1419,10 +1419,28 @@ class MemeMaster(Star):
             reader = await r.multipart()
             field = await reader.next()
             file_data = await field.read()
+            
+            response = web.StreamResponse()
+            response.content_type = 'text/plain'
+            await response.prepare(r)
+
             def unzip_action():
                 with zipfile.ZipFile(io.BytesIO(file_data), 'r') as z: 
                     z.extractall(self.base_dir)
-            await asyncio.get_running_loop().run_in_executor(self.executor, unzip_action)
+            
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(loop.run_in_executor(self.executor, unzip_action))
+            
+            # 发送心跳包保持连接，防止 Cloudflare 等反代的 524 超时
+            while not task.done():
+                try:
+                    await response.write(b" ")
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+            
+            await task
+            
             # 重新加载数据
             self.data = self.load_data()
             self.local_config = self.load_config()
@@ -1430,7 +1448,10 @@ class MemeMaster(Star):
             self.config_mtime = os.path.getmtime(self.config_file) if os.path.exists(self.config_file) else 0
             self.round_count = 0
             self.init_db()
-            return web.Response(text="ok")
+            
+            await response.write(b"ok")
+            await response.write_eof()
+            return response
         except Exception as e:
             return web.Response(status=500, text=str(e))
 
