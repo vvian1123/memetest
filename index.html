@@ -529,6 +529,7 @@
             <h1>Mememaster Pro</h1>
         </div>
         <div class="header-icons">
+            <div class="icon-btn" onclick="openDbManager()" title="数据库"><span style="font-size:1.1rem">🗄️</span></div>
             <div class="icon-btn" onclick="document.getElementById('restoreInput').click()" title="恢复"><span
                     style="font-size:1.1rem">📥</span></div>
             <div class="icon-btn" onclick="backupData()" title="备份"><span style="font-size:1.1rem">📤</span></div>
@@ -687,6 +688,11 @@
                     <input type="text" id="conf_web_token" placeholder="当前密码">
                     <div class="hint">修改此项后，保存成功会自动跳转新链接</div>
                 </div>
+                <div class="form-group">
+                    <label>目标机器人 ID (选填)</label>
+                    <input type="text" id="conf_target_bot_id" placeholder="多个适配器时只在此ID上运行">
+                    <div class="hint">留空则允许所有机器人。填入指定平台机器人ID避免多发。</div>
+                </div>
                 <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
                 <div class="form-group"><label>主动聊天 (分)</label><input type="number" id="conf_proactive_interval"></div>
                 <div style="display:flex; gap:10px;">
@@ -709,6 +715,53 @@
                 <button class="btn-ghost" onclick="closeSettings()">取消</button>
                 <button class="btn-primary" onclick="saveSettings()"
                     style="width:auto; margin-top:0; padding:12px 30px;">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- DB Management Modal -->
+    <div class="modal-overlay" id="dbModal">
+        <div class="modal" style="max-width:720px; max-height:85vh; display:flex; flex-direction:column;">
+            <h3 style="margin:0 0 15px 0">🗄️ 数据库管理</h3>
+            <div class="tabs">
+                <div class="tab active" onclick="dbSwitchTab('dialogue', this)">📚 原文</div>
+                <div class="tab" onclick="dbSwitchTab('fragment', this)">📝 总结</div>
+                <div class="tab" onclick="dbSwitchTab('sticky', this)">📌 强制记忆</div>
+            </div>
+            <div style="display:flex; gap:8px; margin:12px 0;">
+                <input type="text" id="dbSearch" placeholder="搜索内容..."
+                    style="flex:1; padding:10px 14px; border:2px solid #e2e8f0; border-radius:14px; outline:none; font-size:0.9rem;">
+                <button class="btn-primary" onclick="dbLoad(1)"
+                    style="width:auto; margin:0; padding:10px 18px;">🔍</button>
+            </div>
+            <div id="dbList" style="flex:1; overflow-y:auto; min-height:200px;"></div>
+            <div
+                style="display:flex; justify-content:space-between; align-items:center; margin-top:12px; padding-top:10px; border-top:1px solid #f1f5f9;">
+                <span id="dbInfo" style="font-size:0.85rem; color:#94a3b8;">-</span>
+                <div style="display:flex; gap:8px;">
+                    <button class="btn-ghost" id="dbDelBtn" onclick="dbDeleteSelected()"
+                        style="color:#ef4444; display:none;">🗑️ 删选中 (0)</button>
+                    <button class="page-btn" onclick="dbChangePage(-1)">❮</button>
+                    <span id="dbPageInfo"
+                        style="line-height:36px; min-width:50px; text-align:center; font-size:0.9rem;">1/1</span>
+                    <button class="page-btn" onclick="dbChangePage(1)">❯</button>
+                </div>
+            </div>
+            <button class="btn-ghost" onclick="closeDbManager()" style="margin-top:10px; width:100%;">关闭</button>
+        </div>
+    </div>
+
+    <!-- DB Edit Modal -->
+    <div class="modal-overlay" id="dbEditModal">
+        <div class="modal">
+            <h3 style="margin-top:0;">✏️ 编辑记录</h3>
+            <textarea id="dbEditContent"
+                style="width:100%; min-height:150px; padding:12px; border:2px solid #e2e8f0; border-radius:14px; font-size:0.9rem; resize:vertical;"></textarea>
+            <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:15px;">
+                <button class="btn-ghost"
+                    onclick="document.getElementById('dbEditModal').style.display='none'">取消</button>
+                <button class="btn-primary" onclick="dbConfirmEdit()"
+                    style="width:auto; margin:0; padding:10px 24px;">保存</button>
             </div>
         </div>
     </div>
@@ -882,7 +935,7 @@
                 const c = await res.json();
                 const keys = ['auto_save_cooldown', 'debounce_time', 'delay_base', 'delay_factor',
                     'ab_context_rounds', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token',
-                    'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
+                    'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id'];
                 keys.forEach(k => {
                     const el = document.getElementById(`conf_${k}`);
                     if (el) {
@@ -903,13 +956,13 @@
             const conf = {};
             const keys = ['auto_save_cooldown', 'debounce_time', 'delay_base', 'delay_factor',
                 'ab_context_rounds', 'proactive_interval', 'quiet_start',
-                'quiet_end', 'web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
+                'quiet_end', 'web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id'];
 
             keys.forEach(k => {
                 const el = document.getElementById(`conf_${k}`);
                 if (el) {
                     const val = el.value.trim();
-                    if (['web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'].includes(k)) {
+                    if (['web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id'].includes(k)) {
                         conf[k] = val;
                     } else {
                         // 数字字段：如果是空字符串就不传，或者传 0
@@ -1037,6 +1090,87 @@
         }, 10000);  // 每10秒检查一次
 
         init();
+
+        // === DB Management ===
+        let dbState = { type: 'dialogue', page: 1, total: 0, pageSize: 30, selected: new Set(), editingId: null };
+
+        function openDbManager() { document.getElementById('dbModal').style.display = 'flex'; dbLoad(1); }
+        function closeDbManager() { document.getElementById('dbModal').style.display = 'none'; }
+        function dbSwitchTab(type, el) {
+            document.querySelectorAll('#dbModal .tab').forEach(t => t.classList.remove('active')); el.classList.add('active');
+            dbState.type = type; dbState.selected.clear(); dbUpdateDelBtn(); dbLoad(1);
+        }
+        function dbChangePage(d) { const p = dbState.page + d; if (p >= 1 && p <= Math.ceil(dbState.total / dbState.pageSize)) dbLoad(p); }
+
+        async function dbLoad(page) {
+            dbState.page = page;
+            const search = document.getElementById('dbSearch').value.trim();
+            const url = `/api/db/list?token=${token}&type=${dbState.type}&page=${page}&search=${encodeURIComponent(search)}`;
+            try {
+                const res = await fetch(url);
+                const d = await res.json();
+                dbState.total = d.total;
+                const totalPages = Math.max(1, Math.ceil(d.total / d.page_size));
+                document.getElementById('dbPageInfo').innerText = `${page}/${totalPages}`;
+                document.getElementById('dbInfo').innerText = `共 ${d.total} 条`;
+                const list = document.getElementById('dbList');
+                if (!d.rows.length) { list.innerHTML = '<div style="text-align:center; color:#94a3b8; padding:40px;">暂无数据</div>'; return; }
+                list.innerHTML = d.rows.map(r => {
+                    const time = r.created_at ? new Date(r.created_at * 1000).toLocaleString('zh-CN') : '';
+                    const short = r.content.length > 120 ? r.content.slice(0, 120) + '...' : r.content;
+                    const checked = dbState.selected.has(r.id) ? 'checked' : '';
+                    return `<div style="display:flex; gap:10px; align-items:flex-start; padding:10px 0; border-bottom:1px solid #f1f5f9;">
+                        <input type="checkbox" ${checked} onchange="dbToggle(${r.id})" style="margin-top:4px; accent-color:#a855f7;">
+                        <div style="flex:1; min-width:0;">
+                            <div style="font-size:0.85rem; color:#64748b; margin-bottom:4px;">#${r.id} · ${time}</div>
+                            <div style="font-size:0.9rem; word-break:break-all; line-height:1.5;">${short.replace(/</g, '&lt;')}</div>
+                        </div>
+                        <button class="btn-ghost" onclick="dbOpenEdit(${r.id}, ${JSON.stringify(r.content).replace(/"/g, '&quot;')})" style="padding:4px 10px; font-size:0.8rem;">✏️</button>
+                    </div>`;
+                }).join('');
+            } catch (e) { showToast('加载失败'); }
+        }
+
+        function dbToggle(id) {
+            if (dbState.selected.has(id)) dbState.selected.delete(id); else dbState.selected.add(id);
+            dbUpdateDelBtn();
+        }
+        function dbUpdateDelBtn() {
+            const btn = document.getElementById('dbDelBtn');
+            const n = dbState.selected.size;
+            btn.style.display = n > 0 ? 'inline-block' : 'none';
+            btn.innerText = `🗑️ 删选中 (${n})`;
+        }
+        async function dbDeleteSelected() {
+            if (!dbState.selected.size) return;
+            if (!confirm(`确定删除 ${dbState.selected.size} 条记录？`)) return;
+            try {
+                await fetch(`/api/db/delete?token=${token}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ids: [...dbState.selected] })
+                });
+                dbState.selected.clear(); dbUpdateDelBtn();
+                showToast(`✅ 已删除`); dbLoad(dbState.page);
+            } catch (e) { showToast('删除失败'); }
+        }
+
+        function dbOpenEdit(id, content) {
+            dbState.editingId = id;
+            document.getElementById('dbEditContent').value = content;
+            document.getElementById('dbEditModal').style.display = 'flex';
+        }
+        async function dbConfirmEdit() {
+            const content = document.getElementById('dbEditContent').value.trim();
+            if (!content) return showToast('内容不能为空');
+            try {
+                await fetch(`/api/db/edit?token=${token}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: dbState.editingId, content })
+                });
+                document.getElementById('dbEditModal').style.display = 'none';
+                showToast('✅ 已保存'); dbLoad(dbState.page);
+            } catch (e) { showToast('保存失败'); }
+        }
     </script>
 </body>
 

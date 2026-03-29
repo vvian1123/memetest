@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../others"
+		},
+		{
+			"path": "../vvphone"
+		},
+		{
+			"path": "../../app_kisstoy"
+		}
+	],
+	"settings": {}
+}

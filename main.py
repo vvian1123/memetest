@@ -49,7 +49,7 @@ except ImportError:
     HAS_LUNAR = False
 
 from astrbot.api.star import Context, Star, register
-from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain, MessageEventResult
 from astrbot.api.event.filter import EventMessageType
 from astrbot.core.message.components import Image, Plain
 
@@ -442,9 +442,21 @@ class MemeMaster(Star):
     async def handle_private(self, event: AstrMessageEvent):
         await self._master_handler(event)
 
-    @filter.event_message_type(EventMessageType.GROUP_MESSAGE, priority=1)
-    async def handle_group(self, event: AstrMessageEvent):
-        await self._master_handler(event)
+    # 群聊暂不处理（避免刷量和上下文混乱）
+    # @filter.event_message_type(EventMessageType.GROUP_MESSAGE, priority=1)
+    # async def handle_group(self, event: AstrMessageEvent):
+    #     await self._master_handler(event)
+
+    # === 探测器: 检测 AstrBot 是否转发 Notice 事件 ===
+    @filter.event_message_type(EventMessageType.ALL, priority=99)
+    async def notice_probe(self, event: AstrMessageEvent):
+        try:
+            raw = getattr(event.message_obj, 'raw_message', None)
+            if isinstance(raw, dict) and raw.get("post_type") == "notice":
+                print(f"🔔 [Notice Probe] 捕获到 notice 事件! type={raw.get('notice_type')}, sub={raw.get('sub_type')}, user={raw.get('user_id')}", flush=True)
+                print(f"🔔 [Notice Probe] 完整数据: {raw}", flush=True)
+        except Exception:
+            pass
 
     # ==========================
     # 主逻辑
@@ -456,7 +468,13 @@ class MemeMaster(Star):
             if hasattr(self.context, 'get_current_provider_bot'):
                 bot = self.context.get_current_provider_bot()
                 if bot and user_id == str(bot.self_id): return
-        except: pass
+                
+                # 机器人白名单验证：如果配置了目标bot且当前bot不符，跳过
+                target_bot = self.local_config.get("target_bot_id", "").strip()
+                if target_bot and bot and str(bot.self_id) != target_bot:
+                    return
+        except Exception as e:
+            print(f"⚠️ [Meme] bot_id 检测失败: {e}", flush=True)
 
         try:
             self.check_config_reload()
@@ -481,14 +499,39 @@ class MemeMaster(Star):
                         # 传入 msg_str 作为上下文！
                         asyncio.create_task(self.ai_evaluate_image(url, msg_str))
 
-            # 指令穿透 (保持不变)
-            if (msg_str.startswith("/") or msg_str.startswith("！")) and not img_urls:
+            # === /撤回 命令：删除最后一组对话 + 取消防抖 ===
+            if msg_str in ["/撤回", "/undo"]:
+                try:
+                    conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+                    c = conn.cursor()
+                    c.execute("SELECT id FROM memories WHERE type='dialogue' ORDER BY created_at DESC LIMIT 2")
+                    ids = [row[0] for row in c.fetchall()]
+                    if ids:
+                        placeholders = ",".join(["?"] * len(ids))
+                        c.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", ids)
+                        conn.commit()
+                        print(f"🗑️ [Meme] 撤回: 删除了 {len(ids)} 条对话记录 (ids={ids})", flush=True)
+                    conn.close()
+                except Exception as e:
+                    print(f"❌ [Meme] 撤回失败: {e}", flush=True)
+                # 取消防抖中的待发消息
+                if uid in self.sessions:
+                    self.sessions[uid]['queue'].clear()
+                    self.sessions[uid]['flush_event'].set()
+                setattr(event, "__meme_skipped", True)
+                event.set_result(MessageEventResult().message("✅ 已遗忘上一句对话"))
+                return
+
+            # 指令穿透: 其他命令消息不走我们的处理流程
+            cmd_prefixes = ["/", "！", "!"]
+            if msg_str and any(msg_str.startswith(p) for p in cmd_prefixes) and not img_urls:
                 if uid in self.sessions: self.sessions[uid]['flush_event'].set()
+                setattr(event, "__meme_skipped", True)
                 return 
             
-            # 防抖逻辑
-            # "/" 开头的命令跳过防抖，直接放行
+            # "/" 开头兜底
             if msg_str.startswith("/"):
+                setattr(event, "__meme_skipped", True)
                 return
             try: debounce_time = float(self.local_config.get("debounce_time", 3.0))
             except: debounce_time = 3.0
@@ -599,7 +642,6 @@ class MemeMaster(Star):
             chain = [Plain(final_text)]
             for url in img_urls: chain.append(Image.fromURL(url))
             event.message_obj.message = chain
-            
         except Exception as e:
             # 屏蔽空消息日志
             if "not defined" not in str(e): # 过滤常见无关报错
@@ -609,6 +651,7 @@ class MemeMaster(Star):
     @filter.on_decorating_result(priority=0)
     async def on_output(self, event: AstrMessageEvent):
         if getattr(event, "__meme_processed", False): return
+        if getattr(event, "__meme_skipped", False): return  # 命令消息跳过
         
         result = event.get_result()
         if not result: return
@@ -1200,6 +1243,10 @@ class MemeMaster(Star):
         app.router.add_post("/update_sticky", self.h_update_sticky) # <--- 新加
         app.router.add_static("/images/", path=self.img_dir)
         app.router.add_get("/meme_count", self.h_meme_count)
+        # === DB Management API ===
+        app.router.add_get("/api/db/list", self.h_db_list)
+        app.router.add_post("/api/db/delete", self.h_db_delete)
+        app.router.add_post("/api/db/edit", self.h_db_edit)
         runner = web.AppRunner(app)
         await runner.setup()
         port = self.local_config.get("web_port", 5000)
@@ -1458,6 +1505,73 @@ class MemeMaster(Star):
         count = c.fetchone()[0]
         conn.close()
         return web.json_response({"count": count})
+
+    # === DB Management Endpoints ===
+    async def h_db_list(self, r):
+        """列出 memories 表记录 (分页 + 类型筛选 + 搜索)"""
+        if not self.check_auth(r): return web.Response(status=403)
+        mem_type = r.query.get("type", "dialogue")  # dialogue/fragment/sticky
+        page = int(r.query.get("page", 1))
+        search = r.query.get("search", "").strip()
+        page_size = 30
+        offset = (page - 1) * page_size
+        
+        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
+        if search:
+            c.execute("SELECT COUNT(*) FROM memories WHERE type=? AND content LIKE ?", (mem_type, f"%{search}%"))
+        else:
+            c.execute("SELECT COUNT(*) FROM memories WHERE type=?", (mem_type,))
+        total = c.fetchone()[0]
+        
+        if search:
+            c.execute("SELECT id, content, keywords, created_at FROM memories WHERE type=? AND content LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                     (mem_type, f"%{search}%", page_size, offset))
+        else:
+            c.execute("SELECT id, content, keywords, created_at FROM memories WHERE type=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                     (mem_type, page_size, offset))
+        rows = [{"id": r["id"], "content": r["content"], "keywords": r["keywords"] or "", 
+                 "created_at": r["created_at"]} for r in c.fetchall()]
+        conn.close()
+        
+        return web.json_response({"total": total, "page": page, "page_size": page_size, "rows": rows})
+
+    async def h_db_delete(self, r):
+        """删除指定 memories 记录"""
+        if not self.check_auth(r): return web.Response(status=403)
+        data = await r.json()
+        ids = data.get("ids", [])
+        if not ids: return web.json_response({"ok": False, "msg": "no ids"})
+        
+        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+        c = conn.cursor()
+        placeholders = ",".join(["?"] * len(ids))
+        c.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", ids)
+        conn.commit()
+        deleted = c.rowcount
+        conn.close()
+        return web.json_response({"ok": True, "deleted": deleted})
+
+    async def h_db_edit(self, r):
+        """编辑指定 memories 记录的 content"""
+        if not self.check_auth(r): return web.Response(status=403)
+        data = await r.json()
+        mid = data.get("id")
+        content = data.get("content", "").strip()
+        if not mid or not content: return web.json_response({"ok": False, "msg": "missing id or content"})
+        
+        # 重新提取关键词
+        kw = " ".join(jieba.analyse.extract_tags(content, topK=8))
+        
+        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+        c = conn.cursor()
+        c.execute("UPDATE memories SET content=?, keywords=? WHERE id=?", (content, kw, mid))
+        conn.commit()
+        updated = c.rowcount
+        conn.close()
+        return web.json_response({"ok": True, "updated": updated})
 
     async def send_backup_email(self):
         conf = self.local_config
