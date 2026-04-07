@@ -857,7 +857,8 @@ class MemeMaster(Star):
             如果保存，请严格按以下格式回复（若认不出请直接用一句话描述，省略名称）：
             YES
             <准确的名称>:一句简短自然的各种场景使用说明""",
-            "smtp_host": "", "smtp_user": "", "smtp_pass": "", "email_to": "" # 默认设置为空字符串
+            "smtp_host": "", "smtp_user": "", "smtp_pass": "", "email_to": "", # 默认设置为空字符串
+            "typing_debounce": "off", "target_bot_id": ""
         }
         if os.path.exists(self.config_file):
             try:
@@ -1384,7 +1385,7 @@ class MemeMaster(Star):
         try:
             new_conf = await r.json()
             for k, v in new_conf.items():
-                if k in ['web_token', 'ai_prompt', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to']:
+                if k in ['web_token', 'ai_prompt', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id', 'typing_debounce']:
                     # 关键修复：如果 v 是 None 或者 字符串 "None"，就存为空字符串
                     val = str(v) if v is not None else ""
                     if val.lower() == "none": val = ""
