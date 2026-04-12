@@ -147,26 +147,33 @@ class MemeMaster(Star):
         conn.close()
         print("✅ [Meme] 数据库 v2.0 初始化完成 (索引已建立)", flush=True)
 
+    def _db_path(self):
+        return os.path.join(self.base_dir, "meme_core.db")
+
     def _get_config_val(self, key, default="0"):
         """从 system_config 表读取状态值"""
         try:
-            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"), timeout=5)
-            c = conn.cursor()
-            c.execute("SELECT value FROM system_config WHERE key=?", (key,))
-            row = c.fetchone()
-            conn.close()
-            return row[0] if row else default
+            conn = sqlite3.connect(self._db_path(), timeout=5)
+            try:
+                c = conn.cursor()
+                c.execute("SELECT value FROM system_config WHERE key=?", (key,))
+                row = c.fetchone()
+                return row[0] if row else default
+            finally:
+                conn.close()
         except:
             return default
 
     def _set_config_val(self, key, value):
         """写入 system_config 表"""
         try:
-            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"), timeout=5)
-            c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)", (key, str(value)))
-            conn.commit()
-            conn.close()
+            conn = sqlite3.connect(self._db_path(), timeout=5)
+            try:
+                c = conn.cursor()
+                c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)", (key, str(value)))
+                conn.commit()
+            finally:
+                conn.close()
         except Exception as e:
             print(f"❌ [Config] 写入失败 key={key}: {e}", flush=True)
 
@@ -186,7 +193,7 @@ class MemeMaster(Star):
         async with self.db_lock: # <--- 关键：拿锁
             try:
                 kw = self.extract_keywords(content)
-                conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"), timeout=10) # 增加 timeout
+                conn = sqlite3.connect(self._db_path(), timeout=10) # 增加 timeout
                 c = conn.cursor()
                 c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, ?, ?)",
                           (content, kw, msg_type, time.time()))
@@ -200,39 +207,39 @@ class MemeMaster(Star):
 
     def get_related_context(self, current_text):
         """智能检索：找 Sticky + 找相关回忆 (0成本)"""
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        
-        context_list = []
-        
-        # 1. 必读：Sticky 核心规则 (永远置顶)
-        c.execute("SELECT content FROM memories WHERE type='sticky' ORDER BY created_at DESC")
-        stickies = [f"【核心设定/重要事实】 {row['content']}" for row in c.fetchall()]
-        if stickies: context_list.extend(stickies)
+        conn = sqlite3.connect(self._db_path())
+        try:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
 
-        # 2. 选读：根据当前那句话，去搜相关的旧记忆
-        if current_text:
-            search_kws = list(jieba.cut_for_search(current_text)) # 比如 "想吃苹果" -> 苹果
-            search_kws = [w for w in search_kws if len(w) > 1]    # 过滤单字
-            
-            if search_kws:
-                # 构造 SQL: keywords LIKE '%苹果%' OR content LIKE '%苹果%'
-                conditions = []
-                params = []
-                for w in search_kws:
-                    conditions.append("(keywords LIKE ? OR content LIKE ?)")
-                    params.extend([f"%{w}%", f"%{w}%"])
-                
-                if conditions:
-                    # 只找 type='dialogue' (旧对话) 或 'fragment' (旧摘要)，限制 3 条，最近的优先
-                    sql = f"SELECT content, created_at FROM memories WHERE type IN ('dialogue', 'fragment') AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 3"
-                    c.execute(sql, tuple(params))
-                    related = [f"【相关回忆】 {row['content']}" for row in c.fetchall()]
-                    if related: context_list.extend(related)
-        
-        conn.close()
-        return "\n".join(context_list)
+            context_list = []
+
+            # 1. 必读：Sticky 核心规则 (永远置顶)
+            c.execute("SELECT content FROM memories WHERE type='sticky' ORDER BY created_at DESC")
+            stickies = [f"【核心设定/重要事实】 {row['content']}" for row in c.fetchall()]
+            if stickies: context_list.extend(stickies)
+
+            # 2. 选读：根据当前那句话，去搜相关的旧记忆
+            if current_text:
+                search_kws = list(jieba.cut_for_search(current_text))
+                search_kws = [w for w in search_kws if len(w) > 1]
+
+                if search_kws:
+                    conditions = []
+                    params = []
+                    for w in search_kws:
+                        conditions.append("(keywords LIKE ? OR content LIKE ?)")
+                        params.extend([f"%{w}%", f"%{w}%"])
+
+                    if conditions:
+                        sql = f"SELECT content, created_at FROM memories WHERE type IN ('dialogue', 'fragment') AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 3"
+                        c.execute(sql, tuple(params))
+                        related = [f"【相关回忆】 {row['content']}" for row in c.fetchall()]
+                        if related: context_list.extend(related)
+
+            return "\n".join(context_list)
+        finally:
+            conn.close()
         
     def get_meme_candidates(self, current_text):
         """v24: 情绪反转 + 关键词混合检索 (让AI做选择)"""
@@ -263,7 +270,7 @@ class MemeMaster(Star):
         if not search_terms: return []
 
         # 5. 查库
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+        conn = sqlite3.connect(self._db_path())
         c = conn.cursor()
         candidates = []
         
@@ -290,7 +297,7 @@ class MemeMaster(Star):
     def merge_legacy_data(self, legacy_memes=None, legacy_memory="", legacy_buffer=None):
         """将旧 JSON 数据导入 SQLite"""
         try:
-            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
+            conn = sqlite3.connect(self._db_path())
             c = conn.cursor()
             count = 0
             
@@ -368,65 +375,59 @@ class MemeMaster(Star):
                                   (msg_str, kw, time.time()))
 
             conn.commit()
-            conn.close()
             return True, f"成功导入 {count} 张图片 + 记忆 + 对话记录"
         except Exception as e:
             print(f"❌ [Meme] 数据迁移失败: {e}", flush=True)
             return False, str(e)
+        finally:
+            try: conn.close()
+            except: pass
 
 
     def get_db_context(self, current_query=""):
         """v24: 只提取 Sticky + 强相关记忆 (非最近)"""
+        conn = sqlite3.connect(self._db_path())
         try:
-            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            
+
             # 1. Sticky: 按冷却策略，这里只取数据，注入逻辑在 handler 里做
             c.execute("SELECT content FROM memories WHERE type='sticky'")
             stickies = [row['content'] for row in c.fetchall()]
 
             related_fragments = []
-            
+
             # 2. 相关性检索：用 TF-IDF 提取关键词，评分制匹配
             if current_query:
-                # 用 extract_tags (TF-IDF) 提取有区分度的关键词
                 query_words = [w for w in jieba.analyse.extract_tags(current_query, topK=5) if len(w) > 1]
                 if query_words:
-                    # 构建评分表达式：每命中一个关键词 +1 分
                     score_parts = []
                     params_score = []
                     for w in query_words:
                         score_parts.append("(CASE WHEN keywords LIKE ? OR content LIKE ? THEN 1 ELSE 0 END)")
                         params_score.extend([f"%{w}%", f"%{w}%"])
                     score_expr = " + ".join(score_parts)
-                    
-                    # 最低匹配要求：多关键词至少命中2个，单关键词命中1个
+
                     min_score = 2 if len(query_words) >= 2 else 1
-                    
                     context_window = int(self.local_config.get("ab_context_rounds", 50))
-                    
-                    # 拿 2 条相关总结 (fragment)，按评分排序
+
                     sql_frag = f"SELECT content, ({score_expr}) as score FROM memories WHERE type='fragment' AND ({score_expr}) >= {min_score} ORDER BY score DESC, created_at DESC LIMIT 2"
                     c.execute(sql_frag, tuple(params_score * 2))
                     related_fragments = [f"【相关总结】{row['content']}" for row in c.fetchall()]
-                    
-                    # 拿 4 条相关原文 (dialogue)，按时间排序+跳过AB上下文，评分仅做筛选
+
                     sql_dial = f"SELECT content, ({score_expr}) as score FROM memories WHERE type='dialogue' AND ({score_expr}) >= {min_score} ORDER BY created_at DESC LIMIT 4 OFFSET {context_window}"
                     c.execute(sql_dial, tuple(params_score * 2))
                     related_fragments += [f"【相关对话】{row['content']}" for row in c.fetchall()]
 
-            conn.close()
-            
-            # 组装
             context_list = []
-            # Sticky 不在这里拼装，由主逻辑控制频率
-            if related_fragments: 
+            if related_fragments:
                 context_list.extend(related_fragments)
-                
-            return stickies, "\n".join(context_list) # 返回元组
+
+            return stickies, "\n".join(context_list)
         except Exception as e:
             return [], ""
+        finally:
+            conn.close()
             
     def __del__(self):
         self.running = False 
@@ -449,6 +450,10 @@ class MemeMaster(Star):
                         waited += 2
                     else:
                         break
+                # 清理过期的 typing 记录 (超过60秒的)
+                now = time.time()
+                expired = [k for k, v in typing_times.items() if now - v > 60]
+                for k in expired: typing_times.pop(k, None)
             if uid in self.sessions:
                 self.sessions[uid]['flush_event'].set()
         except asyncio.CancelledError:
@@ -534,8 +539,10 @@ class MemeMaster(Star):
                     last_item = self.sessions[uid]['queue'].pop()
                     recalled_content = last_item.get('content', '[图片]') if last_item.get('type') == 'text' else '[图片]'
                     
-                    # 如果撤回后队列空了，说明全撤回了，取消本次 AI 请求
+                    # 如果撤回后队列空了，说明全撤回了，取消计时器和 AI 请求
                     if not self.sessions[uid]['queue']:
+                        timer = self.sessions[uid].get('timer_task')
+                        if timer: timer.cancel()
                         self.sessions[uid]['flush_event'].set()
 
                 setattr(event, "__meme_skipped", True)
@@ -962,15 +969,17 @@ class MemeMaster(Star):
                             return
                 if not img_data: return
                 
-                # 2. 计算指纹并去重
+                # 2. 计算指纹并去重 (先快速查一次，无锁)
                 current_hash = await self._calc_hash_async(img_data)
-                
-                conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-                c = conn.cursor()
-                c.execute("SELECT filename FROM memes WHERE feature_hash = ? AND feature_hash != ''", (current_hash,))
-                exists = c.fetchone()
-                conn.close()
-                
+
+                conn = sqlite3.connect(self._db_path())
+                try:
+                    c = conn.cursor()
+                    c.execute("SELECT filename FROM memes WHERE feature_hash = ? AND feature_hash != ''", (current_hash,))
+                    exists = c.fetchone()
+                finally:
+                    conn.close()
+
                 if exists:
                     print(f"♻️ [自动进货] 指纹匹配，跳过重复图")
                     return
@@ -980,36 +989,40 @@ class MemeMaster(Star):
                 if not provider:
                     print("❌ [自动进货] 错误: 无法获取 AI Provider")
                     return
-                
+
                 raw_prompt = self.local_config.get("ai_prompt", "")
-                # 注入用户发图时的配文上下文
                 prompt = raw_prompt.replace("{context_text}", context_text) if "{context_text}" in raw_prompt else raw_prompt
-                
+
                 resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
                 content = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
-                
+
                 # 4. 处理 AI 回复
                 if "YES" in content:
                     match = re.search(r"<?(?P<tag>[^>\n:：]+)>?[:：]\s*(?P<desc>.*)", content)
                     if match:
                         full_tag = f"{match.group('tag').strip()}: {match.group('desc').strip()}"
                         print(f"🖤 [自动进货] 识图成功: {full_tag}")
-                        
+
                         comp, ext = await self._compress_image(img_data)
                         fn = f"{int(time.time())}_{random.randint(100,999)}{ext}"
                         with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(comp)
-                        
-                        # 5. 写入数据库 (加异步锁)
+
+                        # 5. 写入数据库 (加锁，二次查重防竞态)
                         async with self.db_lock:
+                            conn = sqlite3.connect(self._db_path())
                             try:
-                                conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
                                 c = conn.cursor()
-                                c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, 'auto', ?, ?)", 
+                                c.execute("SELECT filename FROM memes WHERE feature_hash = ? AND feature_hash != ''", (current_hash,))
+                                if c.fetchone():
+                                    print(f"♻️ [自动进货] 并发去重，跳过")
+                                    return
+                                c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, 'auto', ?, ?)",
                                           (fn, full_tag, current_hash, time.time()))
                                 conn.commit()
-                                conn.close()
                             except sqlite3.Error as db_err:
                                 print(f"❌ [自动进货] 数据库写入失败: {db_err}")
+                            finally:
+                                conn.close()
                     else:
                         print(f"⚠️ [自动进货] AI 同意存图但格式解析失败: {content[:50]}...")
                 elif "NO" in content:
@@ -1066,12 +1079,14 @@ class MemeMaster(Star):
                         # ★★★ 1. 获取最近聊天记录，作为上下文 ★★★
                         # 从DB读最近10条对话
                         try:
-                            conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-                            c = conn.cursor()
-                            c.execute("SELECT content FROM memories WHERE type='dialogue' ORDER BY created_at DESC LIMIT 10")
-                            rows = c.fetchall()
-                            conn.close()
-                            recent_log = "\n".join([r[0] for r in reversed(rows)])
+                            conn = sqlite3.connect(self._db_path())
+                            try:
+                                c = conn.cursor()
+                                c.execute("SELECT content FROM memories WHERE type='dialogue' ORDER BY created_at DESC LIMIT 10")
+                                rows = c.fetchall()
+                                recent_log = "\n".join([r[0] for r in reversed(rows)])
+                            finally:
+                                conn.close()
                         except:
                             recent_log = ""
 
@@ -1202,11 +1217,13 @@ class MemeMaster(Star):
     def find_best_match(self, query):
         """从 SQLite 查找最佳匹配的表情包文件路径"""
         # 1. 尝试直接查库
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        c = conn.cursor()
-        c.execute("SELECT filename FROM memes WHERE tags LIKE ? LIMIT 1", (f"%{query}%",))
-        row = c.fetchone()
-        conn.close()
+        conn = sqlite3.connect(self._db_path())
+        try:
+            c = conn.cursor()
+            c.execute("SELECT filename FROM memes WHERE tags LIKE ? LIMIT 1", (f"%{query}%",))
+            row = c.fetchone()
+        finally:
+            conn.close()
     
         if row:
             print(f"🔍 [Meme Match] DB精确命中: query='{query}' → {row[0]}", flush=True)
@@ -1233,19 +1250,26 @@ class MemeMaster(Star):
         return None
 
     
-    def save_config(self): 
-        try: json.dump(self.local_config, open(self.config_file,"w"), indent=2)
+    def save_config(self):
+        try:
+            with open(self.config_file, "w") as f: json.dump(self.local_config, f, indent=2)
         except: pass
-    def load_data(self): return json.load(open(self.data_file)) if os.path.exists(self.data_file) else {}
-    def save_data(self): json.dump(self.data, open(self.data_file,"w"), ensure_ascii=False)
+    def load_data(self):
+        if not os.path.exists(self.data_file): return {}
+        with open(self.data_file, "r") as f: return json.load(f)
+    def save_data(self):
+        with open(self.data_file, "w") as f: json.dump(self.data, f, ensure_ascii=False)
     def load_buffer_from_disk(self):
-        try: return json.load(open(self.buffer_file, "r"))
+        try:
+            with open(self.buffer_file, "r") as f: return json.load(f)
         except: return []
     def save_buffer_to_disk(self):
-        try: json.dump(self.chat_history_buffer, open(self.buffer_file, "w"), ensure_ascii=False)
+        try:
+            with open(self.buffer_file, "w") as f: json.dump(self.chat_history_buffer, f, ensure_ascii=False)
         except: pass
     def load_memory(self):
-        try: return open(self.memory_file, "r", encoding="utf-8").read()
+        try:
+            with open(self.memory_file, "r", encoding="utf-8") as f: return f.read()
         except: return ""
     def read_file(self, n): 
         try: return open(os.path.join(self.base_dir, n), "r", encoding="utf-8").read()
@@ -1296,32 +1320,31 @@ class MemeMaster(Star):
         """上传接口：直接写入 SQLite"""
         if not self.check_auth(r): return web.Response(status=403)
         rd = await r.multipart(); tag = "未分类"
-        
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        c = conn.cursor()
-        
+        files_to_insert = []
+
         while True:
             p = await rd.next()
             if not p: break
             if p.name == "tags": tag = await p.text()
             elif p.name == "file":
                 raw = await p.read()
-                # 1. 压缩保存
                 comp, ext = await self._compress_image(raw)
                 fn = f"{int(time.time()*1000)}_{random.randint(100,999)}{ext}"
                 with open(os.path.join(self.img_dir, fn), "wb") as f: f.write(comp)
-                
-                # 2. 计算 Hash
-                h = await self._calc_hash_async(comp) 
-                
-                # 3. 写入数据库
-                try:
-                    c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, 'manual', ?, ?)",
-                              (fn, tag, h, time.time()))
-                except sqlite3.IntegrityError: pass # 忽略重复文件名
-        
-        conn.commit()
-        conn.close()
+                h = await self._calc_hash_async(comp)
+                files_to_insert.append((fn, tag, h, time.time()))
+
+        async with self.db_lock:
+            conn = sqlite3.connect(self._db_path())
+            try:
+                c = conn.cursor()
+                for row in files_to_insert:
+                    try:
+                        c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, 'manual', ?, ?)", row)
+                    except sqlite3.IntegrityError: pass
+                conn.commit()
+            finally:
+                conn.close()
         return web.Response(text="ok")
 
     async def h_del(self, r):
@@ -1330,44 +1353,44 @@ class MemeMaster(Star):
         data = await r.json()
         filenames = data.get("filenames", [])
         
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        c = conn.cursor()
-        
-        for f in filenames:
-            # 删文件
-            try: os.remove(os.path.join(self.img_dir, f))
-            except: pass
-            # 删库
-            c.execute("DELETE FROM memes WHERE filename=?", (f,))
-            
-        conn.commit()
-        conn.close()
-        return web.Response(text="ok")
+        conn = sqlite3.connect(self._db_path())
+        try:
+            c = conn.cursor()
+            for f in filenames:
+                try: os.remove(os.path.join(self.img_dir, f))
+                except: pass
+                c.execute("DELETE FROM memes WHERE filename=?", (f,))
+            conn.commit()
+            return web.Response(text="ok")
+        finally:
+            conn.close()
 
     async def h_tag(self, r):
         """修改标签接口"""
         if not self.check_auth(r): return web.Response(status=403)
         d = await r.json()
-        
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        c = conn.cursor()
-        c.execute("UPDATE memes SET tags=? WHERE filename=?", (d['tags'], d['filename']))
-        conn.commit()
-        conn.close()
-        
-        return web.Response(text="ok")
+
+        conn = sqlite3.connect(self._db_path())
+        try:
+            c = conn.cursor()
+            c.execute("UPDATE memes SET tags=? WHERE filename=?", (d['tags'], d['filename']))
+            conn.commit()
+            return web.Response(text="ok")
+        finally:
+            conn.close()
 
     async def h_idx(self, r):
         """首页：从数据库读取列表，而不是 self.data"""
         if not self.check_auth(r): return web.Response(status=403, text="Need ?token=xxx")
-        
-        # 从数据库捞所有图
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT filename, tags, source FROM memes ORDER BY created_at DESC")
-        rows = c.fetchall()
-        conn.close()
+
+        conn = sqlite3.connect(self._db_path())
+        try:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT filename, tags, source FROM memes ORDER BY created_at DESC")
+            rows = c.fetchall()
+        finally:
+            conn.close()
         
         # 转成 dict 格式喂给前端 (兼容旧 html 结构)
         # 结构: {"filename": {"tags": "xxx", "source": "manual"}, ...}
@@ -1488,53 +1511,53 @@ class MemeMaster(Star):
 
     async def h_get_stickies(self, r):
         if not self.check_auth(r): return web.Response(status=403)
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        conn.row_factory = sqlite3.Row # 让我们能用字段名取数据
-        c = conn.cursor()
-        # 只取 sticky 类型的记忆，按时间倒序
-        c.execute("SELECT id, content, created_at FROM memories WHERE type='sticky' ORDER BY created_at DESC")
-        rows = [dict(ix) for ix in c.fetchall()]
-        conn.close()
-        return web.json_response(rows)
+        conn = sqlite3.connect(self._db_path())
+        try:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT id, content, created_at FROM memories WHERE type='sticky' ORDER BY created_at DESC")
+            rows = [dict(ix) for ix in c.fetchall()]
+            return web.json_response(rows)
+        finally:
+            conn.close()
 
     async def h_update_sticky(self, r):
         if not self.check_auth(r): return web.Response(status=403)
         data = await r.json()
         action = data.get('action') # add / delete / edit
-        
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        c = conn.cursor()
-        
-        try:
-            if action == 'add':
-                content = data.get('content', '').strip()
-                if content:
-                    # 插入一条 sticky 记忆，权重设为 10 (最高)
-                    c.execute("INSERT INTO memories (content, type, importance, created_at) VALUES (?, 'sticky', 10, ?)", 
-                             (content, time.time()))
-            
-            elif action == 'delete':
-                mid = data.get('id')
-                if mid:
-                    c.execute("DELETE FROM memories WHERE id=? AND type='sticky'", (mid,))
-            
-            elif action == 'edit':
-                mid = data.get('id')
-                content = data.get('content', '').strip()
-                if mid and content:
-                    c.execute("UPDATE memories SET content=? WHERE id=? AND type='sticky'", (content, mid))
-            
-            conn.commit()
-            # 用同一个连接写 config，避免新连接锁冲突
-            c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('round_count', '0')")
-            c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('sticky_updated', '1')")
-            conn.commit()
-            print(f"🔍 [Sticky] WebUI更新，已设置 sticky_updated=1, round_count=0", flush=True)
-            return web.Response(text="ok")
-        except Exception as e:
-            return web.Response(status=500, text=str(e))
-        finally:
-            conn.close()
+
+        async with self.db_lock:
+            conn = sqlite3.connect(self._db_path())
+            try:
+                c = conn.cursor()
+
+                if action == 'add':
+                    content = data.get('content', '').strip()
+                    if content:
+                        c.execute("INSERT INTO memories (content, type, importance, created_at) VALUES (?, 'sticky', 10, ?)",
+                                 (content, time.time()))
+
+                elif action == 'delete':
+                    mid = data.get('id')
+                    if mid:
+                        c.execute("DELETE FROM memories WHERE id=? AND type='sticky'", (mid,))
+
+                elif action == 'edit':
+                    mid = data.get('id')
+                    content = data.get('content', '').strip()
+                    if mid and content:
+                        c.execute("UPDATE memories SET content=? WHERE id=? AND type='sticky'", (content, mid))
+
+                conn.commit()
+                c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('round_count', '0')")
+                c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('sticky_updated', '1')")
+                conn.commit()
+                print(f"🔍 [Sticky] WebUI更新，已设置 sticky_updated=1, round_count=0", flush=True)
+                return web.Response(text="ok")
+            except Exception as e:
+                return web.Response(status=500, text=str(e))
+            finally:
+                conn.close()
             
     async def h_slim(self, r):
         if not self.check_auth(r): return web.Response(status=403)
@@ -1557,12 +1580,15 @@ class MemeMaster(Star):
         return web.Response(text=res)
 
     async def h_meme_count(self, r):
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM memes")
-        count = c.fetchone()[0]
-        conn.close()
-        return web.json_response({"count": count})
+        if not self.check_auth(r): return web.Response(status=403)
+        conn = sqlite3.connect(self._db_path())
+        try:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM memes")
+            count = c.fetchone()[0]
+            return web.json_response({"count": count})
+        finally:
+            conn.close()
 
     # === DB Management Endpoints ===
     async def h_db_list(self, r):
@@ -1574,27 +1600,29 @@ class MemeMaster(Star):
         page_size = 30
         offset = (page - 1) * page_size
         
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        
-        if search:
-            c.execute("SELECT COUNT(*) FROM memories WHERE type=? AND content LIKE ?", (mem_type, f"%{search}%"))
-        else:
-            c.execute("SELECT COUNT(*) FROM memories WHERE type=?", (mem_type,))
-        total = c.fetchone()[0]
-        
-        if search:
-            c.execute("SELECT id, content, keywords, created_at FROM memories WHERE type=? AND content LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                     (mem_type, f"%{search}%", page_size, offset))
-        else:
-            c.execute("SELECT id, content, keywords, created_at FROM memories WHERE type=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                     (mem_type, page_size, offset))
-        rows = [{"id": r["id"], "content": r["content"], "keywords": r["keywords"] or "", 
-                 "created_at": r["created_at"]} for r in c.fetchall()]
-        conn.close()
-        
-        return web.json_response({"total": total, "page": page, "page_size": page_size, "rows": rows})
+        conn = sqlite3.connect(self._db_path())
+        try:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+
+            if search:
+                c.execute("SELECT COUNT(*) FROM memories WHERE type=? AND content LIKE ?", (mem_type, f"%{search}%"))
+            else:
+                c.execute("SELECT COUNT(*) FROM memories WHERE type=?", (mem_type,))
+            total = c.fetchone()[0]
+
+            if search:
+                c.execute("SELECT id, content, keywords, created_at FROM memories WHERE type=? AND content LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                         (mem_type, f"%{search}%", page_size, offset))
+            else:
+                c.execute("SELECT id, content, keywords, created_at FROM memories WHERE type=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                         (mem_type, page_size, offset))
+            rows = [{"id": r["id"], "content": r["content"], "keywords": r["keywords"] or "",
+                     "created_at": r["created_at"]} for r in c.fetchall()]
+
+            return web.json_response({"total": total, "page": page, "page_size": page_size, "rows": rows})
+        finally:
+            conn.close()
 
     async def h_db_delete(self, r):
         """删除指定 memories 记录"""
@@ -1603,14 +1631,16 @@ class MemeMaster(Star):
         ids = data.get("ids", [])
         if not ids: return web.json_response({"ok": False, "msg": "no ids"})
         
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        c = conn.cursor()
-        placeholders = ",".join(["?"] * len(ids))
-        c.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", ids)
-        conn.commit()
-        deleted = c.rowcount
-        conn.close()
-        return web.json_response({"ok": True, "deleted": deleted})
+        conn = sqlite3.connect(self._db_path())
+        try:
+            c = conn.cursor()
+            placeholders = ",".join(["?"] * len(ids))
+            c.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", ids)
+            conn.commit()
+            deleted = c.rowcount
+            return web.json_response({"ok": True, "deleted": deleted})
+        finally:
+            conn.close()
 
     async def h_db_edit(self, r):
         """编辑指定 memories 记录的 content"""
@@ -1623,13 +1653,15 @@ class MemeMaster(Star):
         # 重新提取关键词
         kw = " ".join(jieba.analyse.extract_tags(content, topK=8))
         
-        conn = sqlite3.connect(os.path.join(self.base_dir, "meme_core.db"))
-        c = conn.cursor()
-        c.execute("UPDATE memories SET content=?, keywords=? WHERE id=?", (content, kw, mid))
-        conn.commit()
-        updated = c.rowcount
-        conn.close()
-        return web.json_response({"ok": True, "updated": updated})
+        conn = sqlite3.connect(self._db_path())
+        try:
+            c = conn.cursor()
+            c.execute("UPDATE memories SET content=?, keywords=? WHERE id=?", (content, kw, mid))
+            conn.commit()
+            updated = c.rowcount
+            return web.json_response({"ok": True, "updated": updated})
+        finally:
+            conn.close()
 
     async def send_backup_email(self):
         conf = self.local_config
