@@ -108,13 +108,15 @@ class MemeMaster(Star):
         except Exception as e:
             print(f"❌ [Meme] 服务启动失败: {e}", flush=True)
 
+    DEFAULT_BOT_ID = "default"
+
     def init_db(self):
-        """初始化 SQLite 数据库 (v2.0)"""
+        """初始化 SQLite 数据库 (v3.0 多 Bot 支持)"""
         db_path = os.path.join(self.base_dir, "meme_core.db")
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        
-        # 1. 表情表 (增加 tags 索引以加速检索)
+
+        # 1. 表情表
         c.execute('''CREATE TABLE IF NOT EXISTS memes (
             filename TEXT PRIMARY KEY,
             tags TEXT,
@@ -125,27 +127,65 @@ class MemeMaster(Star):
             usage_count INTEGER DEFAULT 0
         )''')
         c.execute("CREATE INDEX IF NOT EXISTS idx_memes_tags ON memes(tags);")
-        
-        # 2. 记忆表 (核心大改：增加 keywords 字段)
+
+        # 2. 记忆表
         c.execute('''CREATE TABLE IF NOT EXISTS memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
-            keywords TEXT,      -- 存 jieba 提取的关键词
-            type TEXT DEFAULT 'dialogue', -- dialogue(流水), sticky(重要), fragment(旧摘要)
+            keywords TEXT,
+            type TEXT DEFAULT 'dialogue',
             importance INTEGER DEFAULT 1,
             created_at REAL
         )''')
         c.execute("CREATE INDEX IF NOT EXISTS idx_memories_keywords ON memories(keywords);")
         c.execute("CREATE INDEX IF NOT EXISTS idx_memories_content ON memories(content);")
         c.execute("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);")
-        
-        # 3. 访问日志 & 配置表 (保持原样)
+
+        # 3. 访问日志 & 配置表
         c.execute('''CREATE TABLE IF NOT EXISTS access_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, action_type TEXT, timestamp REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS system_config (key TEXT PRIMARY KEY, value TEXT)''')
 
+        # 4. Bots 表 (v3.0 新增)
+        c.execute('''CREATE TABLE IF NOT EXISTS bots (
+            bot_id TEXT PRIMARY KEY,
+            nickname TEXT,
+            created_at REAL,
+            last_active REAL
+        )''')
+
+        # 5. Bot 配置/状态表 (v3.0 新增)
+        c.execute('''CREATE TABLE IF NOT EXISTS bot_configs (
+            bot_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            PRIMARY KEY (bot_id, key)
+        )''')
+
+        # === Schema 迁移：给 memes 和 memories 加 bot_id 列 ===
+        # memes.bot_id: NULL = 全局共享 (手动上传)，否则归属某 bot (自动进货)
+        c.execute("PRAGMA table_info(memes)")
+        meme_cols = [row[1] for row in c.fetchall()]
+        if "bot_id" not in meme_cols:
+            c.execute("ALTER TABLE memes ADD COLUMN bot_id TEXT")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_memes_bot ON memes(bot_id);")
+            print("📦 [Meme] memes 表已升级 (新增 bot_id 列)", flush=True)
+
+        # memories.bot_id: 必填，旧数据迁移到 default bot
+        c.execute("PRAGMA table_info(memories)")
+        memo_cols = [row[1] for row in c.fetchall()]
+        if "bot_id" not in memo_cols:
+            c.execute("ALTER TABLE memories ADD COLUMN bot_id TEXT")
+            c.execute(f"UPDATE memories SET bot_id = '{self.DEFAULT_BOT_ID}' WHERE bot_id IS NULL")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_memories_bot ON memories(bot_id);")
+            print("📦 [Meme] memories 表已升级 (旧数据归入 default bot)", flush=True)
+
+        # 确保 default bot 始终存在 (兜底)
+        c.execute("INSERT OR IGNORE INTO bots (bot_id, nickname, created_at, last_active) VALUES (?, ?, ?, ?)",
+                  (self.DEFAULT_BOT_ID, "默认 Bot", time.time(), time.time()))
+
         conn.commit()
         conn.close()
-        print("✅ [Meme] 数据库 v2.0 初始化完成 (索引已建立)", flush=True)
+        print("✅ [Meme] 数据库 v3.0 初始化完成 (多 Bot 支持已就绪)", flush=True)
 
     def _db_path(self):
         return os.path.join(self.base_dir, "meme_core.db")
@@ -176,6 +216,94 @@ class MemeMaster(Star):
                 conn.close()
         except Exception as e:
             print(f"❌ [Config] 写入失败 key={key}: {e}", flush=True)
+
+    # ==========================
+    # Bot 注册 / 配置 (v3.0)
+    # ==========================
+    def list_bots(self):
+        """列出所有已注册的 bot"""
+        try:
+            conn = sqlite3.connect(self._db_path(), timeout=5)
+            try:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                c.execute("SELECT bot_id, nickname, created_at, last_active FROM bots ORDER BY created_at ASC")
+                return [dict(r) for r in c.fetchall()]
+            finally:
+                conn.close()
+        except Exception:
+            return []
+
+    def register_bot(self, bot_id: str, nickname: str = ""):
+        """注册或更新 bot 信息 (幂等)"""
+        if not bot_id: return
+        bot_id = str(bot_id)
+        nickname = nickname or bot_id
+        try:
+            conn = sqlite3.connect(self._db_path(), timeout=5)
+            try:
+                c = conn.cursor()
+                now = time.time()
+                # 已存在则只更新昵称和活跃时间，不覆盖 created_at
+                c.execute("INSERT OR IGNORE INTO bots (bot_id, nickname, created_at, last_active) VALUES (?, ?, ?, ?)",
+                          (bot_id, nickname, now, now))
+                c.execute("UPDATE bots SET nickname=?, last_active=? WHERE bot_id=?",
+                          (nickname, now, bot_id))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"❌ [Bot] 注册失败 {bot_id}: {e}", flush=True)
+
+    def get_bot_config(self, bot_id: str, key: str, default=""):
+        """读取某个 bot 的某项配置 (优先 bot_configs，回退 local_config 全局值)"""
+        if not bot_id: bot_id = self.DEFAULT_BOT_ID
+        try:
+            conn = sqlite3.connect(self._db_path(), timeout=5)
+            try:
+                c = conn.cursor()
+                c.execute("SELECT value FROM bot_configs WHERE bot_id=? AND key=?", (bot_id, key))
+                row = c.fetchone()
+                if row is not None:
+                    return row[0]
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        # 回退到全局 local_config 中的值（兼容旧逻辑）
+        return self.local_config.get(key, default)
+
+    def set_bot_config(self, bot_id: str, key: str, value):
+        """写入某个 bot 的某项配置"""
+        if not bot_id: bot_id = self.DEFAULT_BOT_ID
+        try:
+            conn = sqlite3.connect(self._db_path(), timeout=5)
+            try:
+                c = conn.cursor()
+                c.execute("INSERT OR REPLACE INTO bot_configs (bot_id, key, value) VALUES (?, ?, ?)",
+                          (bot_id, key, str(value) if value is not None else ""))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"❌ [Bot Config] 写入失败 {bot_id}.{key}: {e}", flush=True)
+
+    def get_all_bot_config(self, bot_id: str):
+        """读取某个 bot 的所有配置 (返回 dict)"""
+        if not bot_id: bot_id = self.DEFAULT_BOT_ID
+        result = {}
+        try:
+            conn = sqlite3.connect(self._db_path(), timeout=5)
+            try:
+                c = conn.cursor()
+                c.execute("SELECT key, value FROM bot_configs WHERE bot_id=?", (bot_id,))
+                for k, v in c.fetchall():
+                    result[k] = v
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return result
 
 
     def extract_keywords(self, text):
