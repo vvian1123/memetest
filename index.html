@@ -516,6 +516,87 @@
             width: 0%;
             transition: width 0.2s linear;
         }
+
+        /* === 多 bot 切换条 === */
+        .bot-bar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 12px;
+            padding: 10px 14px;
+            background: var(--surface);
+            border-radius: 16px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+        }
+        .bot-bar label { font-size: 0.85rem; color: var(--text-sub); flex-shrink: 0; }
+        .bot-bar select {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 12px;
+            background: #fff;
+            font-size: 0.9rem;
+            color: var(--text-main);
+            outline: none;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+        .bot-bar .bot-tag {
+            font-size: 0.75rem;
+            padding: 3px 9px;
+            background: #f1f5f9;
+            color: #64748b;
+            border-radius: 999px;
+            white-space: nowrap;
+        }
+        .badge-bot {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 0.65rem;
+            font-weight: 700;
+            background: rgba(255,255,255,0.92);
+            color: #6366f1;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+            max-width: 50%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .badge-bot.global { color: #16a34a; }
+        /* 速度档位选择 */
+        .speed-row {
+            display: flex;
+            gap: 6px;
+            margin-top: 6px;
+        }
+        .speed-row .pill {
+            flex: 1;
+            padding: 8px 0;
+            text-align: center;
+            border: 1.5px solid #e2e8f0;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            background: #fff;
+            color: var(--text-sub);
+            transition: all 0.15s;
+        }
+        .speed-row .pill.active {
+            background: var(--primary);
+            color: #fff;
+            border-color: var(--primary);
+            box-shadow: 0 4px 10px rgba(99,102,241,0.25);
+        }
+        .speed-detail {
+            display: none;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .speed-detail.show { display: flex; }
+        .speed-detail .form-group { flex: 1; margin: 0; }
     </style>
 </head>
 
@@ -538,6 +619,13 @@
             <div class="icon-btn" style="background:#f3e8ff; color:#a855f7" onclick="openUploadModal()" title="上传"><span
                     style="font-size:1.2rem">💟</span></div>
         </div>
+    </div>
+
+    <!-- 多 bot 切换条：选中后筛选画廊 / 设置 / 备份 -->
+    <div class="bot-bar">
+        <label>🤖 当前 Bot</label>
+        <select id="botSelect" onchange="onBotChange()"></select>
+        <span class="bot-tag" id="botStatTag">-</span>
     </div>
 
     <div class="search-box">
@@ -581,6 +669,12 @@
                 style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:15px; max-height:200px; overflow-y:auto;">
             </div>
             <div class="form-group"><input type="text" id="globalTagInput" placeholder="设置标签 (可选)"></div>
+            <div class="form-group">
+                <label style="font-size:0.78rem; color:#94a3b8;">📦 归属</label>
+                <select id="uploadBotSelect"
+                    style="width:100%; padding:10px 12px; border:2px solid #e2e8f0; border-radius:14px; background:#fff; font-size:0.9rem;"></select>
+                <div class="hint">"全局共享" = 所有 bot 都能用；选某个 bot = 仅该 bot 私有</div>
+            </div>
             <div id="uploadStatus"
                 style="font-size:0.9rem; color:var(--primary); text-align:center; display:none; margin-bottom:5px;">
                 准备中...</div>
@@ -625,13 +719,23 @@
                 ondblclick="document.getElementById('legacyImportSection').style.display='block'; showToast('🔓 已解锁旧数据迁移')">
                 配置中心</h3>
 
+            <!-- 设置作用域提示：当前编辑的是哪个 bot -->
+            <div id="settingsScopeBar"
+                style="background:#eef2ff; color:#4338ca; padding:10px 14px; border-radius:12px; font-size:0.85rem; margin-bottom:14px; display:flex; align-items:center; gap:8px;">
+                <span>🎯 正在编辑：</span>
+                <select id="settingsBotSelect" onchange="onSettingsBotChange()"
+                    style="flex:1; padding:6px 10px; border:1.5px solid #c7d2fe; border-radius:10px; background:#fff; font-size:0.85rem; outline:none;"></select>
+            </div>
+
             <div class="tabs">
                 <div class="tab active" onclick="switchTab('tab-meme', this)">图库</div>
                 <div class="tab" onclick="switchTab('tab-memory', this)">🧠 记忆</div>
-                <div class="tab" onclick="switchTab('tab-logic', this)">逻辑</div>
+                <div class="tab" onclick="switchTab('tab-logic', this)">⚙️ Bot 设置</div>
+                <div class="tab" onclick="switchTab('tab-global', this)">🌐 全局</div>
             </div>
 
             <div id="tab-meme" class="tab-content active">
+                <div style="font-size:0.78rem; color:#94a3b8; margin:-4px 0 10px 0;">📌 该 Tab 设置都是 Bot 级别（仅作用于上方选定的 bot）</div>
                 <div class="form-group"><label>存图冷却 (秒)</label><input type="number" id="conf_auto_save_cooldown"></div>
                 <div class="form-group">
                     <label>鉴图 Prompt</label>
@@ -669,15 +773,34 @@
                 </div>
             </div>
 
+            <!-- Bot 级设置 (上方选定的 bot 单独保存) -->
             <div id="tab-logic" class="tab-content">
-                <div class="form-group"><label>防抖等待 (秒)</label><input type="number" id="conf_debounce_time"></div>
-                <div class="form-group"><label>基础延迟 (秒)</label><input type="number" id="conf_delay_base"></div>
-                <div class="form-group">
-                    <label>字数延迟系数</label>
-                    <input type="number" id="conf_delay_factor">
-                    <div class="hint">每增加1个字符，额外延迟多少秒（推荐 0.05~0.2）</div>
+                <div style="font-size:0.78rem; color:#94a3b8; margin:-4px 0 10px 0;">📌 全部为 Bot 级别（每个 bot 独立保存）</div>
+
+                <!-- 打字速度档位 (合并 delay_base + delay_factor) -->
+                <div class="form-group" style="margin-bottom:8px;">
+                    <label>⚡ 打字速度</label>
+                    <div class="speed-row">
+                        <div class="pill" data-preset="fast" onclick="setSpeedPreset('fast')">🚀 快</div>
+                        <div class="pill active" data-preset="medium" onclick="setSpeedPreset('medium')">🚶 中</div>
+                        <div class="pill" data-preset="slow" onclick="setSpeedPreset('slow')">🐢 慢</div>
+                        <div class="pill" data-preset="custom" onclick="setSpeedPreset('custom')">🎛️ 自定义</div>
+                    </div>
+                    <div class="hint">控制每段消息间隔。"快/中/慢" 已内置经验值，"自定义" 才会出现下方两项</div>
+                    <div class="speed-detail" id="speedDetailRow">
+                        <div class="form-group"><label style="font-size:0.78rem; color:#94a3b8;">基础延迟 (秒)</label><input type="number" step="0.05" id="conf_delay_base"></div>
+                        <div class="form-group"><label style="font-size:0.78rem; color:#94a3b8;">字数系数</label><input type="number" step="0.01" id="conf_delay_factor"></div>
+                    </div>
                 </div>
-                <div class="form-group" style="display:flex; align-items:center; gap:12px;">
+
+                <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
+
+                <div class="form-group">
+                    <label>防抖等待 (秒)</label>
+                    <input type="number" id="conf_debounce_time" step="0.5">
+                    <div class="hint">把多条消息合并再回复的等待窗口。建议按你打字习惯：句句党 3~5s，话痨 15~25s</div>
+                </div>
+                <div class="form-group" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
                     <label style="margin:0;">⌨️ 输入状态智能防抖</label>
                     <select id="conf_typing_debounce"
                         style="padding:8px 14px; border:2px solid #e2e8f0; border-radius:12px; font-size:0.9rem; background:#fff;">
@@ -686,12 +809,33 @@
                     </select>
                     <div class="hint" style="margin:0; font-size:0.8rem;">仅限 Napcat。开启后对方还在打字时机器人会继续等待。</div>
                 </div>
+
                 <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
+
                 <div class="form-group">
                     <label>AstrBot 上下文轮数</label>
                     <input type="number" id="conf_ab_context_rounds" placeholder="50">
-                    <div class="hint">推荐值: 50。自动关联总结频率、Sticky注入和记忆检索策略</div>
+                    <div class="hint">推荐值: 50。自动关联总结频率、Sticky 注入和记忆检索策略</div>
                 </div>
+                <div class="form-group">
+                    <label>表情包匹配阈值 (0~1)</label>
+                    <input type="number" id="conf_meme_match_threshold" step="0.05" placeholder="0.3">
+                    <div class="hint">越小越宽松 (容易匹配)，越大越严格 (推荐 0.3)</div>
+                </div>
+
+                <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
+
+                <div class="form-group"><label>主动聊天 (分钟)</label><input type="number" id="conf_proactive_interval"></div>
+                <div style="display:flex; gap:10px;">
+                    <div class="form-group"><label>静默开始</label><input type="number" id="conf_quiet_start"></div>
+                    <div class="form-group"><label>静默结束</label><input type="number" id="conf_quiet_end"></div>
+                </div>
+            </div>
+
+            <!-- 全局设置 (所有 bot 共享) -->
+            <div id="tab-global" class="tab-content">
+                <div style="font-size:0.78rem; color:#94a3b8; margin:-4px 0 10px 0;">📌 以下设置全局共享，所有 bot 通用</div>
+
                 <div class="form-group">
                     <label>管理台访问 Token (修改后需重新登录)</label>
                     <input type="text" id="conf_web_token" placeholder="当前密码">
@@ -702,14 +846,9 @@
                     <input type="text" id="conf_target_bot_id" placeholder="多个适配器时只在此ID上运行">
                     <div class="hint">留空则允许所有机器人。填入指定平台机器人ID避免多发。</div>
                 </div>
+
                 <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
-                <div class="form-group"><label>主动聊天 (分)</label><input type="number" id="conf_proactive_interval"></div>
-                <div style="display:flex; gap:10px;">
-                    <div class="form-group"><label>静默开始</label><input type="number" id="conf_quiet_start"></div>
-                    <div class="form-group"><label>静默结束</label><input type="number" id="conf_quiet_end"></div>
-                </div>
-                <div style="border-top:1px solid #f1f5f9; margin:15px 0;"></div>
-                <h4 style="margin:0 0 10px 0; font-size:0.9rem; color:#64748b;">📧 邮件自动备份 (不含图片)</h4>
+                <h4 style="margin:0 0 10px 0; font-size:0.9rem; color:#64748b;">📧 邮件自动备份 (始终全量备份所有 bot)</h4>
                 <div class="form-group"><label>SMTP服务器 (如 smtp.qq.com)</label><input type="text" id="conf_smtp_host"
                         placeholder="smtp.qq.com"></div>
                 <div class="form-group"><label>邮箱账号</label><input type="text" id="conf_smtp_user"
@@ -718,6 +857,10 @@
                 <div class="form-group"><label>收件邮箱</label><input type="text" id="conf_email_to"></div>
                 <button class="btn-primary" style="background:#f0fdf4; color:#16a34a; border:1px solid #bbf7d0;"
                     onclick="testEmail()">📧 发送测试备份</button>
+
+                <div style="border-top:1px solid #f1f5f9; margin:18px 0 10px 0;"></div>
+                <h4 style="margin:0 0 10px 0; font-size:0.9rem; color:#64748b;">🤖 已注册 Bot</h4>
+                <div id="botListBox" style="font-size:0.85rem; color:#475569;"></div>
             </div>
 
             <div style="display:flex; justify-content:space-between; margin-top:25px;">
@@ -760,6 +903,23 @@
         </div>
     </div>
 
+    <!-- 备份选择 Modal -->
+    <div class="modal-overlay" id="backupModal">
+        <div class="modal">
+            <h3 style="margin-top:0;">📤 选择备份范围</h3>
+            <div class="form-group">
+                <label>备份内容</label>
+                <select id="backupBotSelect"
+                    style="width:100%; padding:10px 12px; border:2px solid #e2e8f0; border-radius:14px; background:#fff; font-size:0.9rem;"></select>
+                <div class="hint">"全部" 含完整 DB 和图片；选某个 bot 仅导出该 bot 数据 + 全局共享池</div>
+            </div>
+            <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:15px;">
+                <button class="btn-ghost" onclick="document.getElementById('backupModal').style.display='none'">取消</button>
+                <button class="btn-primary" onclick="doBackup()" style="width:auto; margin:0; padding:10px 24px;">下载</button>
+            </div>
+        </div>
+    </div>
+
     <!-- DB Edit Modal -->
     <div class="modal-overlay" id="dbEditModal">
         <div class="modal">
@@ -778,14 +938,145 @@
 
     <script>
         const rawData = {{ MEME_DATA }};
+        const botsData = {{ BOTS_DATA }};
         const token = new URLSearchParams(window.location.search).get('token') || "admin123";
-        let state = { filter: 'all', search: '', page: 1, pageSize: 20, selMode: false, selected: new Set(), items: [], editingFile: null };
+        // bot: "all" = 不筛选；"global" = 仅全局 NULL 池；具体 bot_id = 仅该 bot 视角 (NULL ∪ bot)
+        let state = {
+            filter: 'all', search: '', page: 1, pageSize: 20,
+            selMode: false, selected: new Set(), items: [], editingFile: null,
+            bot: localStorage.getItem('mm_current_bot') || 'all',
+            settingsBot: null,
+        };
         let longPressTimer;
 
-        function init() { process(); render(); }
+        function init() { renderBotSelect(); process(); render(); }
+
+        // 渲染顶部 bot 选择条
+        function renderBotSelect() {
+            const sel = document.getElementById('botSelect');
+            const opts = ['<option value="all">全部 (所有 bot + 全局)</option>',
+                          '<option value="global">🌐 仅全局共享池</option>'];
+            (botsData || []).forEach(b => {
+                opts.push(`<option value="${b.bot_id}">🤖 ${b.nickname || b.bot_id}</option>`);
+            });
+            sel.innerHTML = opts.join('');
+            sel.value = state.bot;
+            updateBotStat();
+            // 上传/备份/设置 modal 内的 bot 下拉同步重建
+            renderUploadBotSelect();
+            renderBackupBotSelect();
+            renderSettingsBotSelect();
+            renderBotListBox();
+        }
+        function updateBotStat() {
+            const tag = document.getElementById('botStatTag');
+            const v = state.bot;
+            if (v === 'all') tag.innerText = `共 ${(botsData || []).length} 个 bot`;
+            else if (v === 'global') tag.innerText = '🌐 全局';
+            else {
+                const b = (botsData || []).find(x => x.bot_id === v);
+                tag.innerText = b ? `${b.meme_count || 0} 图 / ${b.memory_count || 0} 记忆` : '-';
+            }
+        }
+        function onBotChange() {
+            state.bot = document.getElementById('botSelect').value;
+            localStorage.setItem('mm_current_bot', state.bot);
+            updateBotStat();
+            process(); render();
+        }
+        function renderUploadBotSelect() {
+            const sel = document.getElementById('uploadBotSelect');
+            if (!sel) return;
+            const opts = ['<option value="global">🌐 全局共享池 (所有 bot 可用)</option>'];
+            (botsData || []).forEach(b => {
+                opts.push(`<option value="${b.bot_id}">🤖 ${b.nickname || b.bot_id}</option>`);
+            });
+            sel.innerHTML = opts.join('');
+            // 默认随顶部选项：global / 选定 bot；"all" 时缺省 global
+            sel.value = (state.bot === 'all') ? 'global' : state.bot;
+        }
+        function renderBackupBotSelect() {
+            const sel = document.getElementById('backupBotSelect');
+            if (!sel) return;
+            const opts = ['<option value="all">📦 全部 (所有 bot + 完整 DB)</option>'];
+            (botsData || []).forEach(b => {
+                opts.push(`<option value="${b.bot_id}">🤖 仅 ${b.nickname || b.bot_id} (含全局共享)</option>`);
+            });
+            sel.innerHTML = opts.join('');
+            sel.value = (state.bot === 'all' || state.bot === 'global') ? 'all' : state.bot;
+        }
+        function renderSettingsBotSelect() {
+            const sel = document.getElementById('settingsBotSelect');
+            if (!sel) return;
+            const opts = [];
+            (botsData || []).forEach(b => {
+                opts.push(`<option value="${b.bot_id}">🤖 ${b.nickname || b.bot_id}</option>`);
+            });
+            if (!opts.length) opts.push('<option value="default">🤖 默认 Bot</option>');
+            sel.innerHTML = opts.join('');
+            const defaultBot = (state.bot && state.bot !== 'all' && state.bot !== 'global') ? state.bot
+                              : (botsData && botsData[0] ? botsData[0].bot_id : 'default');
+            sel.value = defaultBot;
+            state.settingsBot = sel.value;
+        }
+        function onSettingsBotChange() {
+            state.settingsBot = document.getElementById('settingsBotSelect').value;
+            // 重新拉该 bot 的有效配置
+            loadSettingsForCurrentBot();
+            // 若当前在记忆 tab，刷新该 bot 的 stickies
+            const memTab = document.getElementById('tab-memory');
+            if (memTab && memTab.classList.contains('active')) loadStickies();
+        }
+        function renderBotListBox() {
+            const box = document.getElementById('botListBox');
+            if (!box) return;
+            if (!botsData || !botsData.length) { box.innerText = '暂无注册的 bot'; return; }
+            box.innerHTML = botsData.map(b => `
+                <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #f1f5f9;">
+                    <div>
+                        <div style="font-weight:600;">${b.nickname || b.bot_id}</div>
+                        <div style="font-size:0.75rem; color:#94a3b8;">id=${b.bot_id} · ${b.meme_count || 0} 图 / ${b.memory_count || 0} 记忆</div>
+                    </div>
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn-ghost" style="padding:4px 10px; font-size:0.75rem;" onclick="renameBot('${b.bot_id}')">✏️</button>
+                        ${b.bot_id === 'default' ? '' : `<button class="btn-ghost" style="padding:4px 10px; font-size:0.75rem; color:#ef4444;" onclick="deleteBot('${b.bot_id}')">🗑️</button>`}
+                    </div>
+                </div>`).join('');
+        }
+        async function renameBot(bid) {
+            const cur = (botsData.find(x => x.bot_id === bid) || {}).nickname || bid;
+            const nick = prompt('新昵称：', cur);
+            if (!nick || nick === cur) return;
+            const r = await fetch(`/api/bots/rename?token=${token}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ bot_id: bid, nickname: nick })
+            });
+            const d = await r.json();
+            if (d.ok) { showToast('✅ 已重命名'); setTimeout(() => location.reload(), 600); }
+            else showToast('失败: ' + (d.msg || ''));
+        }
+        async function deleteBot(bid) {
+            if (!confirm(`⚠️ 将彻底删除 bot [${bid}] 的私有 memes / 记忆 / 配置！\n(全局共享池不会被删) 确定吗？`)) return;
+            const r = await fetch(`/api/bots/delete?token=${token}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ bot_id: bid })
+            });
+            const d = await r.json();
+            if (d.ok) { showToast('✅ 已删除'); setTimeout(() => location.reload(), 600); }
+            else showToast('失败: ' + (d.msg || ''));
+        }
+
         function process() {
             let list = Object.entries(rawData);
+            // 1. bot 维度过滤 (优先级最高)
+            if (state.bot === 'global') {
+                list = list.filter(x => x[1].bot_id === null || x[1].bot_id === undefined);
+            } else if (state.bot !== 'all') {
+                list = list.filter(x => x[1].bot_id === null || x[1].bot_id === undefined || x[1].bot_id === state.bot);
+            }
+            // 2. 来源过滤
             if (state.filter !== 'all') list = list.filter(x => (x[1].source || 'manual') === state.filter);
+            // 3. 关键词搜索
             if (state.search) list = list.filter(x => (x[1].tags || "").toLowerCase().includes(state.search.toLowerCase()));
             state.items = list; state.page = 1; updatePage();
         }
@@ -862,6 +1153,8 @@
             const files = document.getElementById('fileInput').files;
             if (!files.length) return showToast('请先选择图片');
             const tag = document.getElementById('globalTagInput').value;
+            const uploadSel = document.getElementById('uploadBotSelect');
+            const targetBot = uploadSel ? uploadSel.value : 'global';
             const btn = document.getElementById('startUploadBtn');
             const status = document.getElementById('uploadStatus');
             const bar = document.getElementById('progressBar');
@@ -871,14 +1164,30 @@
                 const percent = Math.round(((i) / files.length) * 100);
                 fill.style.width = percent + '%';
                 status.innerText = `正在上传 ${i + 1} / ${files.length} ...`;
-                const fd = new FormData(); fd.append('tags', tag || "未分类"); fd.append('file', files[i]);
+                const fd = new FormData();
+                fd.append('tags', tag || "未分类");
+                fd.append('bot_id', targetBot);  // global / 具体 bot_id
+                fd.append('file', files[i]);
                 await fetch(`/upload?token=${token}`, { method: 'POST', body: fd });
             }
             fill.style.width = '100%'; status.innerText = '🎉 完成！等待数据库同步...';
             setTimeout(() => location.reload(), 1500);
         }
 
-        function backupData() { window.location.href = `/backup?token=${token}`; showToast('📦 正在打包...'); }
+        function backupData() {
+            renderBackupBotSelect();
+            document.getElementById('backupModal').style.display = 'flex';
+        }
+        function doBackup() {
+            const sel = document.getElementById('backupBotSelect');
+            const bid = sel ? sel.value : 'all';
+            const url = (bid && bid !== 'all')
+                ? `/backup?token=${token}&bot_id=${encodeURIComponent(bid)}`
+                : `/backup?token=${token}`;
+            document.getElementById('backupModal').style.display = 'none';
+            window.location.href = url;
+            showToast('📦 正在打包...');
+        }
         function handleRestoreFile() {
             const f = document.getElementById('restoreInput').files[0];
             if (!f) return;
@@ -938,53 +1247,135 @@
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active')); el.classList.add('active');
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active')); document.getElementById(id).classList.add('active');
         }
+        // === 配置 key 分类 (跟后端保持一致) ===
+        const GLOBAL_KEYS = ['web_token', 'target_bot_id', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to'];
+        const BOT_KEYS    = ['ai_prompt', 'auto_save_cooldown', 'debounce_time', 'typing_debounce',
+                             'delay_base', 'delay_factor', 'ab_context_rounds', 'meme_match_threshold',
+                             'proactive_interval', 'quiet_start', 'quiet_end'];
+        const STR_KEYS    = new Set(['web_token', 'target_bot_id', 'smtp_host', 'smtp_user', 'smtp_pass',
+                                     'email_to', 'ai_prompt', 'typing_debounce']);
+
+        function _setField(k, val) {
+            const el = document.getElementById(`conf_${k}`);
+            if (!el) return;
+            if (val === null || val === undefined || String(val).toLowerCase() === "none") val = "";
+            el.value = val;
+        }
+
         async function openSettings() {
+            // 先把 modal 打开 (并刷新 bot 选择器)，再异步拉数据
+            renderSettingsBotSelect();
+            document.getElementById('settingsModal').style.display = 'flex';
+            await loadSettingsForCurrentBot();
+        }
+
+        async function loadSettingsForCurrentBot() {
+            const bid = state.settingsBot || 'default';
             try {
-                const res = await fetch(`/get_config?token=${token}`);
-                const c = await res.json();
-                const keys = ['auto_save_cooldown', 'debounce_time', 'delay_base', 'delay_factor',
-                    'ab_context_rounds', 'proactive_interval', 'quiet_start', 'quiet_end', 'web_token',
-                    'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id', 'typing_debounce'];
-                keys.forEach(k => {
-                    const el = document.getElementById(`conf_${k}`);
-                    if (el) {
-                        // 强制过滤掉任何形式的 "None" 字符串
-                        let val = c[k];
-                        if (val === null || val === undefined || String(val).toLowerCase() === "none") {
-                            val = "";
-                        }
-                        el.value = val;
-                    }
-                });
-                document.getElementById('conf_ai_prompt').value = c['ai_prompt'] || "";
-                document.getElementById('settingsModal').style.display = 'flex';
-            } catch (e) { showToast('加载配置失败'); }
+                // 全局 config (不带 bot_id 走老路径返回 local_config)
+                const gRes = await fetch(`/get_config?token=${token}`);
+                const g = await gRes.json();
+                GLOBAL_KEYS.forEach(k => _setField(k, g[k]));
+
+                // bot 级 effective config
+                const bRes = await fetch(`/api/bot_config?token=${token}&bot_id=${encodeURIComponent(bid)}`);
+                const b = await bRes.json();
+                const eff = b.effective || {};
+                BOT_KEYS.forEach(k => _setField(k, eff[k]));
+
+                // 速度档位识别
+                const base = parseFloat(eff.delay_base);
+                const factor = parseFloat(eff.delay_factor);
+                detectSpeedPreset(isFinite(base) ? base : null, isFinite(factor) ? factor : null);
+            } catch (e) {
+                console.error(e);
+                showToast('加载配置失败');
+            }
+        }
+
+        // === 打字速度档位 (delay_base + delay_factor) ===
+        const SPEED_PRESETS = {
+            fast:   { base: 0.3, factor: 0.05 },
+            medium: { base: 0.5, factor: 0.1  },
+            slow:   { base: 1.0, factor: 0.2  },
+        };
+        function setSpeedPreset(name) {
+            document.querySelectorAll('.pill[data-preset]').forEach(p => {
+                p.classList.toggle('active', p.dataset.preset === name);
+            });
+            const detail = document.getElementById('speedDetailRow');
+            if (name === 'custom') {
+                detail.style.display = 'flex';
+            } else {
+                detail.style.display = 'none';
+                const p = SPEED_PRESETS[name];
+                if (p) {
+                    document.getElementById('conf_delay_base').value = p.base;
+                    document.getElementById('conf_delay_factor').value = p.factor;
+                }
+            }
+        }
+        function detectSpeedPreset(base, factor) {
+            // 对照预设表，命中则高亮；否则 custom 并显示自定义输入
+            let matched = 'custom';
+            for (const [name, p] of Object.entries(SPEED_PRESETS)) {
+                if (base !== null && factor !== null
+                    && Math.abs(p.base - base) < 1e-6 && Math.abs(p.factor - factor) < 1e-6) {
+                    matched = name; break;
+                }
+            }
+            document.querySelectorAll('.pill[data-preset]').forEach(p => {
+                p.classList.toggle('active', p.dataset.preset === matched);
+            });
+            document.getElementById('speedDetailRow').style.display = (matched === 'custom') ? 'flex' : 'none';
         }
 
         async function saveSettings() {
-            const conf = {};
-            const keys = ['auto_save_cooldown', 'debounce_time', 'delay_base', 'delay_factor',
-                'ab_context_rounds', 'proactive_interval', 'quiet_start',
-                'quiet_end', 'web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id', 'typing_debounce'];
+            const bid = state.settingsBot || 'default';
+            const globalConf = {};
+            const botConf = {};
 
-            keys.forEach(k => {
+            // 收集全局
+            GLOBAL_KEYS.forEach(k => {
                 const el = document.getElementById(`conf_${k}`);
-                if (el) {
-                    const val = el.value.trim();
-                    if (['web_token', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id', 'typing_debounce'].includes(k)) {
-                        conf[k] = val;
-                    } else {
-                        // 数字字段：如果是空字符串就不传，或者传 0
-                        conf[k] = val === "" ? 0 : parseFloat(val);
-                    }
-                }
+                if (!el) return;
+                const v = (el.value || '').trim();
+                globalConf[k] = STR_KEYS.has(k) ? v : (v === '' ? 0 : parseFloat(v));
             });
-            conf['ai_prompt'] = document.getElementById('conf_ai_prompt').value;
+            // 收集 Bot 级
+            BOT_KEYS.forEach(k => {
+                const el = document.getElementById(`conf_${k}`);
+                if (!el) return;
+                const v = (el.value || '').trim();
+                botConf[k] = STR_KEYS.has(k) ? v : (v === '' ? 0 : parseFloat(v));
+            });
 
-            const res = await fetch(`/update_config?token=${token}`, { method: 'POST', body: JSON.stringify(conf) });
-            if (res.ok) {
-                showToast('配置已保存');
-                setTimeout(() => location.reload(), 500);
+            try {
+                // 1. 全局写 /update_config (不带 bot_id)
+                const r1 = await fetch(`/update_config?token=${token}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(globalConf),
+                });
+                // 2. Bot 级写 /api/bot_config
+                const r2 = await fetch(`/api/bot_config?token=${token}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ bot_id: bid, config: botConf }),
+                });
+                if (!r1.ok) { showToast('全局保存失败'); return; }
+                const d2 = await r2.json();
+                if (!d2.ok) { showToast('Bot 配置失败: ' + (d2.msg || '')); return; }
+                showToast(`✅ 已保存 (Bot=${bid}, 写入 ${d2.written} 项)`);
+                // 如改了 web_token，重定向到新 token
+                const newToken = (globalConf.web_token || '').trim();
+                if (newToken && newToken !== token) {
+                    setTimeout(() => { location.href = `/?token=${encodeURIComponent(newToken)}`; }, 600);
+                } else {
+                    setTimeout(() => location.reload(), 500);
+                }
+            } catch (e) {
+                showToast('保存出错: ' + e.message);
             }
         }
 
@@ -1019,7 +1410,9 @@
             const list = document.getElementById('stickyList');
             list.innerHTML = '<div style="text-align:center; color:#94a3b8;">加载中... 🧠</div>';
             try {
-                const res = await fetch(`/get_stickies?token=${token}`);
+                // Sticky 是 bot 级，跟随 settings 顶部选定的 bot
+                const bid = state.settingsBot || 'default';
+                const res = await fetch(`/get_stickies?token=${token}&bot_id=${encodeURIComponent(bid)}`);
                 const data = await res.json();
                 list.innerHTML = '';
                 if (data.length === 0) {
@@ -1041,7 +1434,11 @@
         async function addSticky() {
             const val = document.getElementById('newStickyInput').value.trim();
             if (!val) return;
-            await fetch(`/update_sticky?token=${token}`, { method: 'POST', body: JSON.stringify({ action: 'add', content: val }) });
+            const bid = state.settingsBot || 'default';
+            await fetch(`/update_sticky?token=${token}`, {
+                method: 'POST',
+                body: JSON.stringify({ action: 'add', content: val, bot_id: bid })
+            });
             document.getElementById('newStickyInput').value = ''; loadStickies();
         }
         async function delSticky(id) {
@@ -1088,11 +1485,13 @@
             } catch (e) { alert('请求失败'); }
         }
 
-        // 自动检测新图
+        // 自动检测新图 (按当前 bot 视角)
         let lastCount = Object.keys(rawData).length;
         setInterval(async () => {
             try {
-                const res = await fetch(`/meme_count?token=${token}`);
+                const botParam = (state.bot && state.bot !== 'all' && state.bot !== 'global')
+                    ? `&bot_id=${encodeURIComponent(state.bot)}` : '';
+                const res = await fetch(`/meme_count?token=${token}${botParam}`);
                 const data = await res.json();
                 if (data.count !== lastCount) { location.reload(); }
             } catch (e) { }
@@ -1114,7 +1513,10 @@
         async function dbLoad(page) {
             dbState.page = page;
             const search = document.getElementById('dbSearch').value.trim();
-            const url = `/api/db/list?token=${token}&type=${dbState.type}&page=${page}&search=${encodeURIComponent(search)}`;
+            // bot 维度：'all'/'global' 不加 bot_id 过滤；具体 bot 则只看该 bot
+            const botParam = (state.bot && state.bot !== 'all' && state.bot !== 'global')
+                ? `&bot_id=${encodeURIComponent(state.bot)}` : '';
+            const url = `/api/db/list?token=${token}&type=${dbState.type}&page=${page}&search=${encodeURIComponent(search)}${botParam}`;
             try {
                 const res = await fetch(url);
                 const d = await res.json();
