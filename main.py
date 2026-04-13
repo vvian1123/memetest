@@ -81,19 +81,24 @@ class MemeMaster(Star):
             self.save_config()
 
         self.data = self.load_data()
-        self.chat_history_buffer = self.load_buffer_from_disk()
+        # 多 bot: buffer 改为 {bot_id: [...]} 字典
+        self.chat_history_buffers = self.load_buffer_from_disk()
         self.current_summary = self.load_memory()
-        self.img_hashes = {} 
-        self.sessions = {} 
-        # round_count 和 sticky_updated 从 DB 读取，不再用实例变量
+        self.img_hashes = {}
+        # 多 bot: sessions/typing 都按 bot_id 隔离；session key = f"{bot_id}::{uid}"
+        self.sessions = {}
+        self._typing_times = {}        # key: (bot_id, user_id) -> ts
+        # round_count 和 sticky_updated 从 DB 读取（且按 bot_id 隔离），不再用实例变量
         self.pending_user_msg = ""
         self.rounds_since_sticky = 0
         self.config_mtime = os.path.getmtime(self.config_file) if os.path.exists(self.config_file) else 0
 
-        
-        self.is_summarizing = False
-        self.last_auto_save_time = 0
-        self.last_active_time = time.time()
+        # 多 bot: 总结/进货冷却/活跃时间 都按 bot_id 隔离
+        self.summarizing_bots = set()      # 正在总结的 bot_id 集合
+        self.last_auto_save_times = {}     # bot_id -> ts
+        self.last_active_times = {}        # bot_id -> ts
+        self.last_uids = {}                # bot_id -> uid
+        self.last_session_ids = {}         # bot_id -> session_id
         self.last_email_date = ""
 
         self.pair_map = {'“': '”', '《': '》', '（': '）', '(': ')', '"': '"', "'": "'"}
@@ -313,28 +318,29 @@ class MemeMaster(Star):
         tags = jieba.analyse.extract_tags(text, topK=10, allowPOS=('n', 'nr', 'ns', 'nt', 'nz', 'v', 'vn'))
         return ",".join(tags)
 
-    async def save_message_to_db(self, content, msg_type='dialogue'):
-        """v24: 异步锁 + 报错屏蔽"""
+    async def save_message_to_db(self, content, msg_type='dialogue', bot_id=None):
+        """v24: 异步锁 + 报错屏蔽。v3.0: 加 bot_id"""
         if not content: return
         if "AstrBot 请求失败" in content or "请在平台日志查看" in content:
             return
-        async with self.db_lock: # <--- 关键：拿锁
+        bot_id = bot_id or self.DEFAULT_BOT_ID
+        async with self.db_lock:
             try:
                 kw = self.extract_keywords(content)
-                conn = sqlite3.connect(self._db_path(), timeout=10) # 增加 timeout
+                conn = sqlite3.connect(self._db_path(), timeout=10)
                 c = conn.cursor()
-                c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, ?, ?)",
-                          (content, kw, msg_type, time.time()))
+                c.execute("INSERT INTO memories (content, keywords, type, created_at, bot_id) VALUES (?, ?, ?, ?, ?)",
+                          (content, kw, msg_type, time.time(), bot_id))
                 conn.commit()
                 conn.close()
             except sqlite3.OperationalError:
-                # 屏蔽 database is locked 报错
-                pass 
+                pass
             except Exception as e:
                 print(f"❌ 存库小错误: {e}", flush=True)
 
-    def get_related_context(self, current_text):
-        """智能检索：找 Sticky + 找相关回忆 (0成本)"""
+    def get_related_context(self, current_text, bot_id=None):
+        """智能检索：找 Sticky + 找相关回忆 (0成本)。v3.0: 按 bot_id 隔离"""
+        bot_id = bot_id or self.DEFAULT_BOT_ID
         conn = sqlite3.connect(self._db_path())
         try:
             conn.row_factory = sqlite3.Row
@@ -343,7 +349,7 @@ class MemeMaster(Star):
             context_list = []
 
             # 1. 必读：Sticky 核心规则 (永远置顶)
-            c.execute("SELECT content FROM memories WHERE type='sticky' ORDER BY created_at DESC")
+            c.execute("SELECT content FROM memories WHERE type='sticky' AND bot_id=? ORDER BY created_at DESC", (bot_id,))
             stickies = [f"【核心设定/重要事实】 {row['content']}" for row in c.fetchall()]
             if stickies: context_list.extend(stickies)
 
@@ -360,8 +366,8 @@ class MemeMaster(Star):
                         params.extend([f"%{w}%", f"%{w}%"])
 
                     if conditions:
-                        sql = f"SELECT content, created_at FROM memories WHERE type IN ('dialogue', 'fragment') AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 3"
-                        c.execute(sql, tuple(params))
+                        sql = f"SELECT content, created_at FROM memories WHERE bot_id=? AND type IN ('dialogue', 'fragment') AND ({' OR '.join(conditions)}) ORDER BY created_at DESC LIMIT 3"
+                        c.execute(sql, (bot_id, *params))
                         related = [f"【相关回忆】 {row['content']}" for row in c.fetchall()]
                         if related: context_list.extend(related)
 
@@ -369,8 +375,9 @@ class MemeMaster(Star):
         finally:
             conn.close()
         
-    def get_meme_candidates(self, current_text):
-        """v24: 情绪反转 + 关键词混合检索 (让AI做选择)"""
+    def get_meme_candidates(self, current_text, bot_id=None):
+        """v24: 情绪反转 + 关键词混合检索 (让AI做选择)。v3.0: 全局 + bot 自有"""
+        bot_id = bot_id or self.DEFAULT_BOT_ID
         if not current_text: return []
         
         # 1. 情绪反转字典 (用户哭 -> 搜安慰)
@@ -397,21 +404,20 @@ class MemeMaster(Star):
         
         if not search_terms: return []
 
-        # 5. 查库
+        # 5. 查库 (v3.0: 全局 NULL ∪ bot 自有)
         conn = sqlite3.connect(self._db_path())
         c = conn.cursor()
         candidates = []
-        
+
         try:
             for term in list(search_terms):
-                # 模糊匹配标签
-                c.execute("SELECT tags FROM memes WHERE tags LIKE ? ORDER BY usage_count DESC LIMIT 3", (f"%{term}%",))
+                c.execute("SELECT tags FROM memes WHERE tags LIKE ? AND (bot_id IS NULL OR bot_id=?) ORDER BY usage_count DESC LIMIT 3",
+                          (f"%{term}%", bot_id))
                 for row in c.fetchall():
                     candidates.append(row[0])
             # === 保底机制：如果搜出来的太少，随机补货 ===
             if len(candidates) < 2:
-                # 随机拿 5 个，保证 AI 只要想发图总有货
-                c.execute("SELECT tags FROM memes ORDER BY RANDOM() LIMIT 3")
+                c.execute("SELECT tags FROM memes WHERE (bot_id IS NULL OR bot_id=?) ORDER BY RANDOM() LIMIT 3", (bot_id,))
                 for row in c.fetchall():
                     candidates.append(row[0])
         except: pass
@@ -429,12 +435,14 @@ class MemeMaster(Star):
             c = conn.cursor()
             count = 0
             
-            # 1. 导入旧 meme.json
+            # 1. 导入旧 meme.json (历史手动上传保持全局 NULL，自动进货归入默认 bot)
             if legacy_memes:
                 for fn, info in legacy_memes.items():
                     try:
-                        c.execute("INSERT OR IGNORE INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-                                  (fn, info.get('tags'), info.get('source', 'manual'), info.get('hash', ''), time.time()))
+                        src = info.get('source', 'manual')
+                        legacy_bot = None if src == 'manual' else self.DEFAULT_BOT_ID
+                        c.execute("INSERT OR IGNORE INTO memes (filename, tags, source, feature_hash, created_at, bot_id) VALUES (?, ?, ?, ?, ?, ?)",
+                                  (fn, info.get('tags'), src, info.get('hash', ''), time.time(), legacy_bot))
                         count += 1
                     except: pass
             
@@ -491,16 +499,16 @@ class MemeMaster(Star):
                     # 有日期就加前缀
                     full_content = f"{date_str} | {content}" if date_str else content
                     kw = self.extract_keywords(full_content)
-                    c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'fragment', ?)",
-                              (full_content, kw, time.time()))
-            # 3. 导入 buffer.json
+                    c.execute("INSERT INTO memories (content, keywords, type, created_at, bot_id) VALUES (?, ?, 'fragment', ?, ?)",
+                              (full_content, kw, time.time(), self.DEFAULT_BOT_ID))
+            # 3. 导入 buffer.json (旧数据归入默认 bot)
             if legacy_buffer and isinstance(legacy_buffer, list):
                 for msg in legacy_buffer:
                     msg_str = str(msg).strip()
                     if msg_str and "AstrBot 请求失败" not in msg_str:
                         kw = self.extract_keywords(msg_str)
-                        c.execute("INSERT INTO memories (content, keywords, type, created_at) VALUES (?, ?, 'dialogue', ?)",
-                                  (msg_str, kw, time.time()))
+                        c.execute("INSERT INTO memories (content, keywords, type, created_at, bot_id) VALUES (?, ?, 'dialogue', ?, ?)",
+                                  (msg_str, kw, time.time(), self.DEFAULT_BOT_ID))
 
             conn.commit()
             return True, f"成功导入 {count} 张图片 + 记忆 + 对话记录"
@@ -512,15 +520,16 @@ class MemeMaster(Star):
             except: pass
 
 
-    def get_db_context(self, current_query=""):
-        """v24: 只提取 Sticky + 强相关记忆 (非最近)"""
+    def get_db_context(self, current_query="", bot_id=None):
+        """v24: 只提取 Sticky + 强相关记忆 (非最近)。v3.0: 按 bot_id 隔离"""
+        bot_id = bot_id or self.DEFAULT_BOT_ID
         conn = sqlite3.connect(self._db_path())
         try:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
 
             # 1. Sticky: 按冷却策略，这里只取数据，注入逻辑在 handler 里做
-            c.execute("SELECT content FROM memories WHERE type='sticky'")
+            c.execute("SELECT content FROM memories WHERE type='sticky' AND bot_id=?", (bot_id,))
             stickies = [row['content'] for row in c.fetchall()]
 
             related_fragments = []
@@ -537,14 +546,15 @@ class MemeMaster(Star):
                     score_expr = " + ".join(score_parts)
 
                     min_score = 2 if len(query_words) >= 2 else 1
-                    context_window = int(self.local_config.get("ab_context_rounds", 50))
+                    # ab_context_rounds 改为 bot 级配置
+                    context_window = int(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50)))
 
-                    sql_frag = f"SELECT content, ({score_expr}) as score FROM memories WHERE type='fragment' AND ({score_expr}) >= {min_score} ORDER BY score DESC, created_at DESC LIMIT 2"
-                    c.execute(sql_frag, tuple(params_score * 2))
+                    sql_frag = f"SELECT content, ({score_expr}) as score FROM memories WHERE bot_id=? AND type='fragment' AND ({score_expr}) >= {min_score} ORDER BY score DESC, created_at DESC LIMIT 2"
+                    c.execute(sql_frag, (*params_score, bot_id, *params_score))
                     related_fragments = [f"【相关总结】{row['content']}" for row in c.fetchall()]
 
-                    sql_dial = f"SELECT content, ({score_expr}) as score FROM memories WHERE type='dialogue' AND ({score_expr}) >= {min_score} ORDER BY created_at DESC LIMIT 4 OFFSET {context_window}"
-                    c.execute(sql_dial, tuple(params_score * 2))
+                    sql_dial = f"SELECT content, ({score_expr}) as score FROM memories WHERE bot_id=? AND type='dialogue' AND ({score_expr}) >= {min_score} ORDER BY created_at DESC LIMIT 4 OFFSET {context_window}"
+                    c.execute(sql_dial, (*params_score, bot_id, *params_score))
                     related_fragments += [f"【相关对话】{row['content']}" for row in c.fetchall()]
 
             context_list = []
@@ -560,18 +570,21 @@ class MemeMaster(Star):
     def __del__(self):
         self.running = False 
 
-    async def _debounce_timer(self, uid: str, duration: float):
-        """防抖计时器: 支持正在输入延长"""
+    async def _debounce_timer(self, sess_key: str, duration: float, bot_id: str = None, user_id: str = None):
+        """防抖计时器: 支持正在输入延长。v3.0: 按 (bot_id, user_id) 查 typing 状态。"""
         try:
             await asyncio.sleep(duration)
             # 智能延长: 仅在启用输入检测时生效
             if self.local_config.get("typing_debounce", "off").strip().lower() in ["on", "1", "true", "开"]:
-                typing_times = getattr(self, '_typing_times', {})
-                user_id = uid.split(':')[-1] if ':' in uid else uid
+                typing_times = self._typing_times
+                # 兼容老式调用 (没传 bot_id/user_id 时尝试从 sess_key 解析)
+                if user_id is None:
+                    user_id = sess_key.split(':')[-1] if ':' in sess_key else sess_key
+                tk = (bot_id or self.DEFAULT_BOT_ID, str(user_id))
                 max_extra_wait = 30
                 waited = 0
                 while waited < max_extra_wait:
-                    last_type = typing_times.get(user_id, 0)
+                    last_type = typing_times.get(tk, 0)
                     if time.time() - last_type < 3.0:
                         print(f"⌨️ [Debounce] 用户还在输入，继续等待...", flush=True)
                         await asyncio.sleep(2.0)
@@ -582,8 +595,8 @@ class MemeMaster(Star):
                 now = time.time()
                 expired = [k for k, v in typing_times.items() if now - v > 60]
                 for k in expired: typing_times.pop(k, None)
-            if uid in self.sessions:
-                self.sessions[uid]['flush_event'].set()
+            if sess_key in self.sessions:
+                self.sessions[sess_key]['flush_event'].set()
         except asyncio.CancelledError:
             pass
 
@@ -609,10 +622,9 @@ class MemeMaster(Star):
             if raw.get('notice_type') == 'notify' and raw.get('sub_type') == 'input_status':
                 uid = str(raw.get('user_id', ''))
                 if uid:
-                    if not hasattr(self, '_typing_times'):
-                        self._typing_times = {}
-                    self._typing_times[uid] = time.time()
-                    print(f"⌨️ [Typing] 用户 {uid} 正在输入", flush=True)
+                    bot_id = self._bot_id_from_event(event)
+                    self._typing_times[(bot_id, uid)] = time.time()
+                    print(f"⌨️ [Typing] bot={bot_id} 用户 {uid} 正在输入", flush=True)
         except Exception:
             pass
 
@@ -643,6 +655,7 @@ class MemeMaster(Star):
 
     async def _master_handler(self, event: AstrMessageEvent):
         # 1. 基础防爆 & 自检
+        bot_id = self.DEFAULT_BOT_ID
         try:
             user_id = str(event.message_obj.sender.user_id)
             if hasattr(self.context, 'get_current_provider_bot'):
@@ -657,6 +670,8 @@ class MemeMaster(Star):
             # 自动注册当前 bot
             bot_id, nickname = self._current_bot_info(event)
             self.register_bot(bot_id, nickname)
+            # 把 bot_id 挂在 event 上，方便 on_output 等下游拿
+            setattr(event, "__meme_bot_id", bot_id)
         except Exception as e:
             print(f"⚠️ [Meme] bot_id 检测失败: {e}", flush=True)
 
@@ -664,40 +679,44 @@ class MemeMaster(Star):
             self.check_config_reload()
             msg_str = (event.message_str or "").strip()
             uid = event.unified_msg_origin
+            # 多 bot: session key 加 bot_id 前缀，避免不同 bot 撞 key
+            sess_key = f"{bot_id}::{uid}"
             img_urls = self._get_all_img_urls(event)
 
             # 空消息过滤
-            if not msg_str and not img_urls: return 
+            if not msg_str and not img_urls: return
 
-            print(f"📨 [Meme] 收到: {msg_str[:10]}... (图:{len(img_urls)})", flush=True)
-            self.last_active_time = time.time()
-            self.last_uid = uid
-            self.last_session_id = event.session_id
+            print(f"📨 [Meme] 收到[{bot_id}]: {msg_str[:10]}... (图:{len(img_urls)})", flush=True)
+            now_ts = time.time()
+            self.last_active_times[bot_id] = now_ts
+            self.last_uids[bot_id] = uid
+            self.last_session_ids[bot_id] = event.session_id
 
-            # 自动进货 (逻辑微调：加冷却判断)
+            # 自动进货 (按 bot 各自维护冷却)
             if img_urls:
                 cd = float(self.local_config.get("auto_save_cooldown", 60))
-                if time.time() - self.last_auto_save_time > cd:
-                    self.last_auto_save_time = time.time()
+                last_save = self.last_auto_save_times.get(bot_id, 0)
+                if now_ts - last_save > cd:
+                    self.last_auto_save_times[bot_id] = now_ts
                     for url in img_urls:
-                        # 传入 msg_str 作为上下文！
-                        asyncio.create_task(self.ai_evaluate_image(url, msg_str))
+                        # 传入 msg_str 作为上下文，bot_id 决定写入哪个 bot 的图库
+                        asyncio.create_task(self.ai_evaluate_image(url, msg_str, bot_id=bot_id))
 
             # === /撤回 命令：撤回刚刚输入的一句话 ===
             if msg_str in ["/撤回", "/undo"]:
                 has_pending = False
                 recalled_content = ""
-                if uid in self.sessions and self.sessions[uid]['queue']:
+                if sess_key in self.sessions and self.sessions[sess_key]['queue']:
                     has_pending = True
                     # 只移除队列里的最后一条消息
-                    last_item = self.sessions[uid]['queue'].pop()
+                    last_item = self.sessions[sess_key]['queue'].pop()
                     recalled_content = last_item.get('content', '[图片]') if last_item.get('type') == 'text' else '[图片]'
-                    
+
                     # 如果撤回后队列空了，说明全撤回了，取消计时器和 AI 请求
-                    if not self.sessions[uid]['queue']:
-                        timer = self.sessions[uid].get('timer_task')
+                    if not self.sessions[sess_key]['queue']:
+                        timer = self.sessions[sess_key].get('timer_task')
                         if timer: timer.cancel()
-                        self.sessions[uid]['flush_event'].set()
+                        self.sessions[sess_key]['flush_event'].set()
 
                 setattr(event, "__meme_skipped", True)
                 if has_pending:
@@ -711,10 +730,10 @@ class MemeMaster(Star):
             # 指令穿透: 其他命令消息不走我们的处理流程
             cmd_prefixes = ["/", "！", "!"]
             if msg_str and any(msg_str.startswith(p) for p in cmd_prefixes) and not img_urls:
-                if uid in self.sessions: self.sessions[uid]['flush_event'].set()
+                if sess_key in self.sessions: self.sessions[sess_key]['flush_event'].set()
                 setattr(event, "__meme_skipped", True)
-                return 
-            
+                return
+
             # "/" 开头兜底
             if msg_str.startswith("/"):
                 setattr(event, "__meme_skipped", True)
@@ -725,38 +744,44 @@ class MemeMaster(Star):
 
 
             if debounce_time > 0:
-                if uid in self.sessions:
-                    s = self.sessions[uid]
+                # 取该用户的真实 user_id 用于 typing 检测匹配
+                try:
+                    real_uid = str(event.message_obj.sender.user_id)
+                except Exception:
+                    real_uid = uid
+
+                if sess_key in self.sessions:
+                    s = self.sessions[sess_key]
                     if msg_str: s['queue'].append({'type': 'text', 'content': msg_str})
                     for url in img_urls: s['queue'].append({'type': 'image', 'url': url})
-                    
+
                     if s.get('timer_task'): s['timer_task'].cancel()
-                    s['timer_task'] = asyncio.create_task(self._debounce_timer(uid, debounce_time))
-                    
+                    s['timer_task'] = asyncio.create_task(self._debounce_timer(sess_key, debounce_time, bot_id, real_uid))
+
                     event.stop_event()
                     print(f"⏳ [Meme] 防抖追加 (Q:{len(s['queue'])})", flush=True)
-                    return 
+                    return
 
                 print(f"🆕 [Meme] 启动防抖 ({debounce_time}s)...", flush=True)
                 flush_event = asyncio.Event()
-                timer_task = asyncio.create_task(self._debounce_timer(uid, debounce_time))
-                
+                timer_task = asyncio.create_task(self._debounce_timer(sess_key, debounce_time, bot_id, real_uid))
+
                 initial_queue = []
                 if msg_str: initial_queue.append({'type': 'text', 'content': msg_str})
                 for url in img_urls: initial_queue.append({'type': 'image', 'url': url})
 
-                self.sessions[uid] = {
+                self.sessions[sess_key] = {
                     'queue': initial_queue, 'flush_event': flush_event, 'timer_task': timer_task
                 }
-                
+
                 await flush_event.wait()
-                
-                if uid not in self.sessions: 
+
+                if sess_key not in self.sessions:
                     event.stop_event()
-                    return 
-                s = self.sessions.pop(uid)
+                    return
+                s = self.sessions.pop(sess_key)
                 queue = s['queue']
-                if not queue: 
+                if not queue:
                     event.stop_event()
                     return
 
@@ -765,32 +790,35 @@ class MemeMaster(Star):
                 for item in queue:
                     if item['type'] == 'text': combined_text_list.append(item['content'])
                     elif item['type'] == 'image': combined_images.append(item['url'])
-                
+
                 msg_str = " ".join(combined_text_list)
                 img_urls = combined_images
 
             # === 核心修改区开始 ===
-            
+
             # 1. 【防应声虫】：绝对不在这里 save_message_to_db (User)！
             # 我们把用户的话暂存在 event 对象里，传给 on_output
-            event.user_text_raw = msg_str 
+            event.user_text_raw = msg_str
             if img_urls:
                 setattr(event, "user_has_image", True)
 
             # 2. 准备 System Context
             time_info = self.get_full_time_str()
-            
-            # 3. 检索记忆 (异步执行，防止阻塞)
-            stickies, related_context = await asyncio.to_thread(self.get_db_context, msg_str)
-            
+
+            # 3. 检索记忆 (异步执行，防止阻塞，按 bot_id 隔离)
+            stickies, related_context = await asyncio.to_thread(self.get_db_context, msg_str, bot_id)
+
             # 4. Sticky 注入逻辑（频率由 ab_context_rounds 自动计算）
-            ab_rounds = int(self.local_config.get("ab_context_rounds", 50))
+            ab_rounds = int(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50)))
             sticky_freq = ab_rounds if ab_rounds <= 20 else ab_rounds // 2
-            
+
             # === Sticky 变更检测 (用内容 hash，不依赖 h_update_sticky 写标记) ===
-            round_count = int(self._get_config_val("round_count", "0"))
+            # 多 bot: round_count / sticky_hash 按 bot_id 隔离
+            rc_key = f"round_count_{bot_id}"
+            sh_key = f"sticky_hash_{bot_id}"
+            round_count = int(self._get_config_val(rc_key, "0"))
             current_hash = str(hash(tuple(sorted(stickies)))) if stickies else "empty"
-            stored_hash = self._get_config_val("sticky_hash", "")
+            stored_hash = self._get_config_val(sh_key, "")
             sticky_changed = (current_hash != stored_hash) and stickies
             should_inject = (round_count % sticky_freq == 0) or sticky_changed
             
@@ -806,17 +834,17 @@ class MemeMaster(Star):
                 sticky_str = " ".join([f"({s})" for s in stickies])
                 system_tag += f"Important Facts (Established Knowledge): {sticky_str}\n"
                 system_tag += "(NOTE: You already KNOW these facts. Do NOT repeat them in your response unless asked.)\n"
-                # 更新 hash + 重置计数
-                self._set_config_val("sticky_hash", current_hash)
+                # 更新 hash + 重置计数 (按 bot_id 隔离)
+                self._set_config_val(sh_key, current_hash)
                 if sticky_changed:
-                    self._set_config_val("round_count", "0")
+                    self._set_config_val(rc_key, "0")
 
             if related_context:
                 system_tag += f"Historical Context (Recall): {related_context}\n"
                 system_tag += "(NOTE: The above 'Historical Context' is for background info ONLY. Do NOT reply to it as if it marks the current conversation state.)\n"
-            
-            # 6. 智能检索表情包 (异步执行)
-            meme_hints = await asyncio.to_thread(self.get_meme_candidates, msg_str)
+
+            # 6. 智能检索表情包 (异步执行，按 bot_id 隔离)
+            meme_hints = await asyncio.to_thread(self.get_meme_candidates, msg_str, bot_id)
             if meme_hints:
                 hints_str = " ".join([f"<MEME:{t}>" for t in meme_hints])
                 system_tag += f"Available Memes (copy EXACT tag to use): {hints_str}\n"
@@ -844,10 +872,13 @@ class MemeMaster(Star):
     async def on_output(self, event: AstrMessageEvent):
         if getattr(event, "__meme_processed", False): return
         if getattr(event, "__meme_skipped", False): return  # 命令消息跳过
-        
+
         result = event.get_result()
         if not result: return
-        
+
+        # 优先从 _master_handler 挂上的 bot_id 取，否则现场探测
+        bot_id = getattr(event, "__meme_bot_id", None) or self._bot_id_from_event(event)
+
         text = ""
         if isinstance(result, list):
             for c in result:
@@ -856,24 +887,24 @@ class MemeMaster(Star):
             for c in result.chain:
                 if isinstance(c, Plain): text += c.text
         else: text = str(result)
-            
+
         if not text: return
         setattr(event, "__meme_processed", True)
-        
+
         # === DEBUG 3: 看 on_output 收到的原始文本 ===
         has_meme_tag = "<MEME:" in text or "MEME_TAG:" in text
-        print(f"🔍 [Meme Debug] 有标签={has_meme_tag}, 原文前150字: {text[:150]}", flush=True)
-        
+        print(f"🔍 [Meme Debug][{bot_id}] 有标签={has_meme_tag}, 原文前150字: {text[:150]}", flush=True)
+
         text = self.clean_markdown(text)
-        
+
         # 如果 AI 输出了 [[MEM:生日是5.20]]，立刻拦截并存入 Sticky
         mem_match = re.search(r"\[\[MEM:(.*?)\]\]", text)
         if mem_match:
             mem_content = mem_match.group(1).strip()
             if mem_content:
                 print(f"📝 [Meme] AI 捕获重要事实: {mem_content}", flush=True)
-                # 存为 sticky 类型
-                await self.save_message_to_db(mem_content, 'sticky')
+                # 存为 sticky 类型 (按 bot_id 隔离)
+                await self.save_message_to_db(mem_content, 'sticky', bot_id=bot_id)
                 self.sticky_updated = True
             # 从回复给用户的文本里删掉这行指令，用户看不到
             text = text.replace(mem_match.group(0), "").strip()
@@ -883,24 +914,25 @@ class MemeMaster(Star):
         if getattr(event, "user_has_image", False):
             user_raw += " [图片]"
         user_raw = user_raw.strip()
-        
+
         # 清理掉 System Context (兼容旧版和新 XML 版)
         ai_clean = re.sub(r"\(System Context:.*?\)", "", text).strip()
         ai_clean = re.sub(r"<system_context>.*?</system_context>", "", ai_clean, flags=re.DOTALL).strip()
         ai_clean = re.sub(r"<MEME:.*?>", "", ai_clean).strip()  # 也清掉 meme 标签
-        
+
         if user_raw and ai_clean:
             pair_log = f"User: {user_raw}\nAI: {ai_clean}"
-            self.chat_history_buffer.append(pair_log)
+            self._buf(bot_id).append(pair_log)
             self.save_buffer_to_disk()
-            await self.save_message_to_db(pair_log, 'dialogue')
-            new_rc = int(self._get_config_val("round_count", "0")) + 1
-            self._set_config_val("round_count", str(new_rc))
+            await self.save_message_to_db(pair_log, 'dialogue', bot_id=bot_id)
+            rc_key = f"round_count_{bot_id}"
+            new_rc = int(self._get_config_val(rc_key, "0")) + 1
+            self._set_config_val(rc_key, str(new_rc))
             self.rounds_since_sticky += 1
 
-        
-        if not self.is_summarizing:
-            asyncio.create_task(self.check_and_summarize())
+
+        if bot_id not in self.summarizing_bots:
+            asyncio.create_task(self.check_and_summarize(bot_id))
 
         try:
             # 表情包解析 (兼容反引号包裹)
@@ -917,8 +949,8 @@ class MemeMaster(Star):
                 elif "MEME_TAG:" in part: tag = part.replace("MEME_TAG:", "").strip()
                 
                 if tag:
-                    path = self.find_best_match(tag)
-                    if path: 
+                    path = self.find_best_match(tag, bot_id=bot_id)
+                    if path:
                         print(f"🎯 [Meme] 命中表情包: [{tag}]", flush=True)
                         mixed_chain.append(Image.fromFileSystem(path))
                         has_meme = True
@@ -932,8 +964,8 @@ class MemeMaster(Star):
 
 
             segments = self.smart_split(mixed_chain)
-            delay_base = self.local_config.get("delay_base", 0.5)
-            delay_factor = self.local_config.get("delay_factor", 0.1)
+            delay_base = float(self.get_bot_config(bot_id, "delay_base", self.local_config.get("delay_base", 0.5)))
+            delay_factor = float(self.get_bot_config(bot_id, "delay_factor", self.local_config.get("delay_factor", 0.1)))
             
             for i, seg in enumerate(segments):
                 txt_len = sum(len(c.text) for c in seg if isinstance(c, Plain))
@@ -1039,9 +1071,10 @@ class MemeMaster(Star):
                     self.config_mtime = mtime   # ← 加这行
             except: pass
             
-    async def check_and_summarize(self):
-        """v24: 纯粹的总结逻辑 (只生成 Fragment，不重复提取 Sticky)"""
-        ab_rounds = int(self.local_config.get("ab_context_rounds", 50))
+    async def check_and_summarize(self, bot_id: str = None):
+        """v24: 纯粹的总结逻辑 (只生成 Fragment，不重复提取 Sticky)。v3.0: 按 bot_id 隔离"""
+        bot_id = bot_id or self.DEFAULT_BOT_ID
+        ab_rounds = int(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50)))
         if ab_rounds <= 20:
             threshold = ab_rounds
             summary_words = 150
@@ -1051,22 +1084,23 @@ class MemeMaster(Star):
         else:
             threshold = 50
             summary_words = 400
-        if len(self.chat_history_buffer) < threshold or self.is_summarizing: 
+        buf = self._buf(bot_id)
+        if len(buf) < threshold or bot_id in self.summarizing_bots:
             return
-        
-        self.is_summarizing = True 
+
+        self.summarizing_bots.add(bot_id)
         try:
-            print(f"🧠 [Meme] 正在消化记忆 (积压: {len(self.chat_history_buffer)} 条)...", flush=True)
+            print(f"🧠 [Meme][{bot_id}] 正在消化记忆 (积压: {len(buf)} 条)...", flush=True)
             now_str = self.get_full_time_str()
             # 从 buffer 提取实际消息日期范围
-            first_msg = self.chat_history_buffer[0] if self.chat_history_buffer else ""
+            first_msg = buf[0] if buf else ""
             date_match = re.search(r'\d{4}-\d{2}-\d{2}', first_msg)
             msg_date = date_match.group() if date_match else now_str.split(' ')[0]
-            history_text = "\n".join(self.chat_history_buffer)
-            
+            history_text = "\n".join(buf)
+
             provider = self.context.get_using_provider()
             if not provider: return
-            
+
             prompt = f"""当前时间：{now_str}
                 这是一段过去的对话记录。请将其总结为简练的"长期记忆"。
                 【重要规则】如果对话跨越多天，必须按日期分段总结，格式如：
@@ -1079,12 +1113,12 @@ class MemeMaster(Star):
 
                 对话内容：
                 {history_text}"""
-            
+
             resp = await provider.text_chat(prompt, session_id=None)
             summary = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
             # 简单清洗一下
             summary = self.clean_markdown(summary)
-            
+
             if summary:
                 # 按行分段存储，每段独立一条 fragment，方便精准检索
                 lines = summary.split("\n")
@@ -1095,20 +1129,21 @@ class MemeMaster(Star):
                     # 如果这行没有日期前缀，加上日期
                     if not re.match(r"\[?\d{4}", line):
                         line = f"[{msg_date}] {line}"
-                    await self.save_message_to_db(line, 'fragment')
-                
-                # 清空 buffer
-                self.chat_history_buffer = [] 
+                    await self.save_message_to_db(line, 'fragment', bot_id=bot_id)
+
+                # 清空该 bot 的 buffer
+                self.chat_history_buffers[bot_id] = []
                 self.save_buffer_to_disk()
-                print(f"✨ [Meme] 总结完成，已存入片段库。", flush=True)
+                print(f"✨ [Meme][{bot_id}] 总结完成，已存入片段库。", flush=True)
 
         except Exception as e:
-            print(f"❌ [Meme] 总结失败: {e}", flush=True)
+            print(f"❌ [Meme][{bot_id}] 总结失败: {e}", flush=True)
         finally:
-            self.is_summarizing = False
+            self.summarizing_bots.discard(bot_id)
             
-    async def ai_evaluate_image(self, img_url, context_text=""):
-        """v24 Ultimate: 并发锁 + 上下文注入 + 数据库锁 + 详细报错"""
+    async def ai_evaluate_image(self, img_url, context_text="", bot_id=None):
+        """v24 Ultimate: 并发锁 + 上下文注入 + 数据库锁 + 详细报错。v3.0: 自动进货归属 bot_id"""
+        bot_id = bot_id or self.DEFAULT_BOT_ID
         # 1. API 通行证：串行执行防 429
         async with self.api_semaphore:
             try:
@@ -1170,8 +1205,8 @@ class MemeMaster(Star):
                                 if c.fetchone():
                                     print(f"♻️ [自动进货] 并发去重，跳过")
                                     return
-                                c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, 'auto', ?, ?)",
-                                          (fn, full_tag, current_hash, time.time()))
+                                c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at, bot_id) VALUES (?, ?, 'auto', ?, ?, ?)",
+                                          (fn, full_tag, current_hash, time.time(), bot_id))
                                 conn.commit()
                             except sqlite3.Error as db_err:
                                 print(f"❌ [自动进货] 数据库写入失败: {db_err}")
@@ -1194,7 +1229,7 @@ class MemeMaster(Star):
 
 
     async def _lonely_watcher(self):
-        while self.running: 
+        while self.running:
             await asyncio.sleep(60)
             today = datetime.datetime.now().strftime('%Y-%m-%d')
             hour = datetime.datetime.now().hour
@@ -1205,112 +1240,112 @@ class MemeMaster(Star):
                         self.last_email_date = today
                         print("📧 [Meme] 每日备份邮件已发送", flush=True)
                     except: pass
- 
+
             self.check_config_reload()
-            
-            interval = self.local_config.get("proactive_interval", 0)
-            if interval <= 0: continue
-            
-            q_start = self.local_config.get("quiet_start", -1)
-            q_end = self.local_config.get("quiet_end", -1)
-            if q_start != -1 and q_end != -1:
-                h = datetime.datetime.now().hour
-                is_quiet = False
-                if q_start > q_end: 
-                    if h >= q_start or h < q_end: is_quiet = True
-                else:
-                    if q_start <= h < q_end: is_quiet = True
-                if is_quiet: continue
-            
-            if time.time() - self.last_active_time > (interval * 60):
-                self.last_active_time = time.time() 
+
+            # 多 bot: 每个 bot 独立判断主动聊天
+            for bot in self.list_bots():
+                bot_id = bot["bot_id"]
+                interval = float(self.get_bot_config(bot_id, "proactive_interval",
+                                                    self.local_config.get("proactive_interval", 0)) or 0)
+                if interval <= 0: continue
+
+                q_start = float(self.get_bot_config(bot_id, "quiet_start",
+                                                  self.local_config.get("quiet_start", -1)) or -1)
+                q_end = float(self.get_bot_config(bot_id, "quiet_end",
+                                                self.local_config.get("quiet_end", -1)) or -1)
+                if q_start != -1 and q_end != -1:
+                    h = datetime.datetime.now().hour
+                    is_quiet = False
+                    if q_start > q_end:
+                        if h >= q_start or h < q_end: is_quiet = True
+                    else:
+                        if q_start <= h < q_end: is_quiet = True
+                    if is_quiet: continue
+
+                last_active = self.last_active_times.get(bot_id, 0)
+                if last_active <= 0: continue  # 该 bot 还没收到过消息，跳过
+                if time.time() - last_active <= (interval * 60): continue
+
+                self.last_active_times[bot_id] = time.time()
                 provider = self.context.get_using_provider()
-                uid = getattr(self, "last_uid", None)
-                if provider and uid:
+                uid = self.last_uids.get(bot_id)
+                if not (provider and uid): continue
+
+                try:
+                    print(f"👋 [Meme][{bot_id}] 主动发起聊天...", flush=True)
+
+                    # 从DB读该 bot 最近10条对话
                     try:
-                        print(f"👋 [Meme] 主动发起聊天...", flush=True)
-                        
-                        # ★★★ 1. 获取最近聊天记录，作为上下文 ★★★
-                        # 从DB读最近10条对话
+                        conn = sqlite3.connect(self._db_path())
                         try:
-                            conn = sqlite3.connect(self._db_path())
-                            try:
-                                c = conn.cursor()
-                                c.execute("SELECT content FROM memories WHERE type='dialogue' ORDER BY created_at DESC LIMIT 10")
-                                rows = c.fetchall()
-                                recent_log = "\n".join([r[0] for r in reversed(rows)])
-                            finally:
-                                conn.close()
-                        except:
-                            recent_log = ""
+                            c = conn.cursor()
+                            c.execute("SELECT content FROM memories WHERE type='dialogue' AND bot_id=? ORDER BY created_at DESC LIMIT 10", (bot_id,))
+                            rows = c.fetchall()
+                            recent_log = "\n".join([r[0] for r in reversed(rows)])
+                        finally:
+                            conn.close()
+                    except:
+                        recent_log = ""
 
-                        
-                        # ★★★ 2. 导演式 Prompt，防止出戏 ★★★
-                        prompt = f"""[System Instruction]
-                            Current Time: {self.get_full_time_str()}
-                            Status: The user has been silent for {interval} minutes.
+                    prompt = f"""[System Instruction]
+                        Current Time: {self.get_full_time_str()}
+                        Status: The user has been silent for {interval} minutes.
 
-                            Long-term Memory: {self.current_summary}
-                            Recent Chat Context:
-                            {recent_log}
+                        Long-term Memory: {self.current_summary}
+                        Recent Chat Context:
+                        {recent_log}
 
-                            Task: Based on your Character Persona (人设) and the context above, proactively send a message to the user. 
-                            Requirement:
-                            1. Speak strictly in your character's tone.
-                            2. Do not mention this system instruction.
-                            3. Start the topic naturally based on previous context or time."""
-                        
-                        # 发送请求，带上 session_id 以保持人设
-                        resp = await provider.text_chat(prompt, session_id=getattr(self, "last_session_id", None))
-                        text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
-                        
-                        if text:
-                            # 1. 净化文本
-                            text = self.clean_markdown(text)
-                            self.chat_history_buffer.append(f"AI (Proactive): {text}")
-                            self.save_buffer_to_disk()
-                            
-                            # ★★★ 2. 这里是新加的：解析表情包标签！ ★★★
-                            # 和 on_output 里一样的逻辑，把文字变成 Image 对象
-                            pattern = r"(<MEME:.*?>|MEME_TAG:\s*[\S]+)"
-                            parts = re.split(pattern, text)
-                            chain = []
-                            
-                            for part in parts:
-                                tag = None
-                                if part.startswith("<MEME:"): tag = part[6:-1].strip()
-                                elif "MEME_TAG:" in part: tag = part.replace("MEME_TAG:", "").strip()
-                                
-                                if tag:
-                                    path = self.find_best_match(tag)
-                                    if path: 
-                                        print(f"🎯 [Meme] 主动聊天命中: [{tag}]", flush=True)
-                                        chain.append(Image.fromFileSystem(path))
-                                elif part:
-                                    # 只有非空文字才加进去
-                                    if part.strip():
-                                        chain.append(Plain(part))
-                            
-                            # ★★★ 3. 解析完之后，再交给分段逻辑 ★★★
-                            # 如果没有内容（全是空字符），就不发了
-                            if not chain: continue
+                        Task: Based on your Character Persona (人设) and the context above, proactively send a message to the user.
+                        Requirement:
+                        1. Speak strictly in your character's tone.
+                        2. Do not mention this system instruction.
+                        3. Start the topic naturally based on previous context or time."""
 
-                            segments = self.smart_split(chain)
-                            
-                            delay_base = self.local_config.get("delay_base", 0.5)
-                            delay_factor = self.local_config.get("delay_factor", 0.1)
+                    resp = await provider.text_chat(prompt, session_id=self.last_session_ids.get(bot_id))
+                    text = (getattr(resp, "completion_text", None) or getattr(resp, "text", "")).strip()
 
-                            for i, seg in enumerate(segments):
-                                txt_len = sum(len(c.text) for c in seg if isinstance(c, Plain))
-                                wait = delay_base + (txt_len * delay_factor)
-                                
-                                mc = MessageChain()
-                                mc.chain = seg
-                                await self.context.send_message(uid, mc)
-                                if i < len(segments) - 1: await asyncio.sleep(wait)
+                    if text:
+                        text = self.clean_markdown(text)
+                        self._buf(bot_id).append(f"AI (Proactive): {text}")
+                        self.save_buffer_to_disk()
 
-                    except Exception as e:
-                        print(f"❌ [Meme] 主动聊天出错: {e}", flush=True)
+                        pattern = r"(<MEME:.*?>|MEME_TAG:\s*[\S]+)"
+                        parts = re.split(pattern, text)
+                        chain = []
+
+                        for part in parts:
+                            tag = None
+                            if part.startswith("<MEME:"): tag = part[6:-1].strip()
+                            elif "MEME_TAG:" in part: tag = part.replace("MEME_TAG:", "").strip()
+
+                            if tag:
+                                path = self.find_best_match(tag, bot_id=bot_id)
+                                if path:
+                                    print(f"🎯 [Meme][{bot_id}] 主动聊天命中: [{tag}]", flush=True)
+                                    chain.append(Image.fromFileSystem(path))
+                            elif part:
+                                if part.strip():
+                                    chain.append(Plain(part))
+
+                        if not chain: continue
+
+                        segments = self.smart_split(chain)
+
+                        delay_base = float(self.get_bot_config(bot_id, "delay_base", self.local_config.get("delay_base", 0.5)))
+                        delay_factor = float(self.get_bot_config(bot_id, "delay_factor", self.local_config.get("delay_factor", 0.1)))
+
+                        for i, seg in enumerate(segments):
+                            txt_len = sum(len(c.text) for c in seg if isinstance(c, Plain))
+                            wait = delay_base + (txt_len * delay_factor)
+
+                            mc = MessageChain()
+                            mc.chain = seg
+                            await self.context.send_message(uid, mc)
+                            if i < len(segments) - 1: await asyncio.sleep(wait)
+
+                except Exception as e:
+                    print(f"❌ [Meme][{bot_id}] 主动聊天出错: {e}", flush=True)
 
     async def _init_image_hashes(self):
         if not os.path.exists(self.img_dir): return
@@ -1368,39 +1403,41 @@ class MemeMaster(Star):
             if isinstance(c, Image): urls.append(c.url)
         return urls
 
-    def find_best_match(self, query):
-        """从 SQLite 查找最佳匹配的表情包文件路径"""
-        # 1. 尝试直接查库
+    def find_best_match(self, query, bot_id=None):
+        """从 SQLite 查找最佳匹配的表情包文件路径。v3.0: 全局 ∪ bot 自有"""
+        bot_id = bot_id or self.DEFAULT_BOT_ID
+        # 1. 尝试直接查库 (全局 + bot 自有)
         conn = sqlite3.connect(self._db_path())
         try:
             c = conn.cursor()
-            c.execute("SELECT filename FROM memes WHERE tags LIKE ? LIMIT 1", (f"%{query}%",))
+            c.execute("SELECT filename FROM memes WHERE tags LIKE ? AND (bot_id IS NULL OR bot_id=?) LIMIT 1",
+                      (f"%{query}%", bot_id))
             row = c.fetchone()
         finally:
             conn.close()
-    
+
         if row:
             print(f"🔍 [Meme Match] DB精确命中: query='{query}' → {row[0]}", flush=True)
             return os.path.join(self.img_dir, row[0])
-        
-        # 2. 如果库里没查到，再遍历 self.data
-        threshold = float(self.local_config.get("meme_match_threshold", 0.3))  # ← 改动A：读配置
+
+        # 2. 如果库里没查到，再遍历 self.data (legacy 兼容，不区分 bot)
+        threshold = float(self.local_config.get("meme_match_threshold", 0.3))
         best, score = None, 0
         for f, i in self.data.items():
             t = i.get("tags", "")
             if query in t:
                 print(f"🔍 [Meme Match] data精确命中: query='{query}' → {f}", flush=True)
                 return os.path.join(self.img_dir, f)
-            name = t.split(":")[0] if ":" in t else t          # ← 改动B：拆出名字
-            desc = t.split(":")[-1] if ":" in t else ""        # ← 拆出描述
-            s = max(                                            # ← 改动C：两个都比
+            name = t.split(":")[0] if ":" in t else t
+            desc = t.split(":")[-1] if ":" in t else ""
+            s = max(
                 difflib.SequenceMatcher(None, query, name).ratio(),
                 difflib.SequenceMatcher(None, query, desc).ratio()
             )
             if s > score: score = s; best = f
-        
+
         print(f"🔍 [Meme Match] 模糊匹配: query='{query}', 最佳={best}, 分数={score:.2f}, 阈值={threshold}", flush=True)
-        if score >= threshold: return os.path.join(self.img_dir, best)  # ← 0.4 改成 threshold
+        if score >= threshold: return os.path.join(self.img_dir, best)
         return None
 
     
@@ -1414,13 +1451,29 @@ class MemeMaster(Star):
     def save_data(self):
         with open(self.data_file, "w") as f: json.dump(self.data, f, ensure_ascii=False)
     def load_buffer_from_disk(self):
+        """v3.0: 返回 {bot_id: [...]} 字典；兼容旧版纯 list (迁移到 default bot)"""
         try:
-            with open(self.buffer_file, "r") as f: return json.load(f)
-        except: return []
+            with open(self.buffer_file, "r") as f:
+                raw = json.load(f)
+            if isinstance(raw, list):
+                # 旧格式：迁移到 default bot
+                return {self.DEFAULT_BOT_ID: raw}
+            if isinstance(raw, dict):
+                # 新格式
+                return {k: (v if isinstance(v, list) else []) for k, v in raw.items()}
+        except: pass
+        return {}
     def save_buffer_to_disk(self):
         try:
-            with open(self.buffer_file, "w") as f: json.dump(self.chat_history_buffer, f, ensure_ascii=False)
+            with open(self.buffer_file, "w") as f: json.dump(self.chat_history_buffers, f, ensure_ascii=False)
         except: pass
+
+    def _buf(self, bot_id):
+        """获取某个 bot 的 buffer 列表 (不存在则创建)"""
+        bot_id = bot_id or self.DEFAULT_BOT_ID
+        if bot_id not in self.chat_history_buffers:
+            self.chat_history_buffers[bot_id] = []
+        return self.chat_history_buffers[bot_id]
     def load_memory(self):
         try:
             with open(self.memory_file, "r", encoding="utf-8") as f: return f.read()
@@ -1622,9 +1675,8 @@ class MemeMaster(Star):
             # 重新加载数据
             self.data = self.load_data()
             self.local_config = self.load_config()
-            self.chat_history_buffer = self.load_buffer_from_disk()
+            self.chat_history_buffers = self.load_buffer_from_disk()
             self.config_mtime = os.path.getmtime(self.config_file) if os.path.exists(self.config_file) else 0
-            self.round_count = 0
             self.init_db()
             
             await response.write(b"ok")
@@ -1679,6 +1731,8 @@ class MemeMaster(Star):
         if not self.check_auth(r): return web.Response(status=403)
         data = await r.json()
         action = data.get('action') # add / delete / edit
+        # 多 bot: 允许指定 bot_id (前端尚未支持时回退到 default)
+        target_bot = (data.get('bot_id') or self.DEFAULT_BOT_ID).strip() or self.DEFAULT_BOT_ID
 
         async with self.db_lock:
             conn = sqlite3.connect(self._db_path())
@@ -1688,8 +1742,8 @@ class MemeMaster(Star):
                 if action == 'add':
                     content = data.get('content', '').strip()
                     if content:
-                        c.execute("INSERT INTO memories (content, type, importance, created_at) VALUES (?, 'sticky', 10, ?)",
-                                 (content, time.time()))
+                        c.execute("INSERT INTO memories (content, type, importance, created_at, bot_id) VALUES (?, 'sticky', 10, ?, ?)",
+                                 (content, time.time(), target_bot))
 
                 elif action == 'delete':
                     mid = data.get('id')
@@ -1703,10 +1757,10 @@ class MemeMaster(Star):
                         c.execute("UPDATE memories SET content=? WHERE id=? AND type='sticky'", (content, mid))
 
                 conn.commit()
-                c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('round_count', '0')")
-                c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('sticky_updated', '1')")
+                # 重置该 bot 的 sticky 注入计数器，触发下次必读
+                c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)", (f"round_count_{target_bot}", "0"))
                 conn.commit()
-                print(f"🔍 [Sticky] WebUI更新，已设置 sticky_updated=1, round_count=0", flush=True)
+                print(f"🔍 [Sticky] WebUI更新 bot={target_bot}，已重置 round_count", flush=True)
                 return web.Response(text="ok")
             except Exception as e:
                 return web.Response(status=500, text=str(e))
