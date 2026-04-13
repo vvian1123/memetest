@@ -949,7 +949,7 @@
         };
         let longPressTimer;
 
-        function init() { renderBotSelect(); process(); render(); }
+        function init() { renderBotSelect(); process(); render(); recomputeLastCount(); }
 
         // 渲染顶部 bot 选择条
         function renderBotSelect() {
@@ -983,6 +983,21 @@
             localStorage.setItem('mm_current_bot', state.bot);
             updateBotStat();
             process(); render();
+            // 切换 bot 后，重新校准轮询基线 (否则下次 /meme_count 比对会误触发刷新)
+            recomputeLastCount();
+            // 上传 modal 默认归属也跟着变
+            renderUploadBotSelect();
+        }
+        // 按当前 bot 视角重算 lastCount (跟服务端 /meme_count 的过滤逻辑一致)
+        function recomputeLastCount() {
+            const items = Object.values(rawData);
+            if (state.bot === 'global') {
+                lastCount = items.filter(x => x.bot_id === null || x.bot_id === undefined).length;
+            } else if (state.bot === 'all') {
+                lastCount = items.length;
+            } else {
+                lastCount = items.filter(x => x.bot_id === null || x.bot_id === undefined || x.bot_id === state.bot).length;
+            }
         }
         function renderUploadBotSelect() {
             const sel = document.getElementById('uploadBotSelect');
@@ -1485,8 +1500,8 @@
             } catch (e) { alert('请求失败'); }
         }
 
-        // 自动检测新图 (按当前 bot 视角)
-        let lastCount = Object.keys(rawData).length;
+        // 自动检测新图 (按当前 bot 视角；init() 会用 recomputeLastCount 校准)
+        let lastCount = 0;
         setInterval(async () => {
             try {
                 const botParam = (state.bot && state.bot !== 'all' && state.bot !== 'global')
