@@ -1553,6 +1553,12 @@ class MemeMaster(Star):
         app.router.add_get("/api/db/list", self.h_db_list)
         app.router.add_post("/api/db/delete", self.h_db_delete)
         app.router.add_post("/api/db/edit", self.h_db_edit)
+        # === Multi-Bot API (v3.0) ===
+        app.router.add_get("/api/bots", self.h_bots_list)
+        app.router.add_post("/api/bots/rename", self.h_bots_rename)
+        app.router.add_post("/api/bots/delete", self.h_bots_delete)
+        app.router.add_get("/api/bot_config", self.h_bot_config_get)
+        app.router.add_post("/api/bot_config", self.h_bot_config_set)
         runner = web.AppRunner(app)
         await runner.setup()
         port = self.local_config.get("web_port", 5000)
@@ -1562,15 +1568,19 @@ class MemeMaster(Star):
 
 
     async def h_up(self, r):
-        """上传接口：直接写入 SQLite"""
+        """上传接口：直接写入 SQLite。
+        支持 form 字段 bot_id：留空 / "global" / "" → 写全局 (bot_id=NULL)，否则归属指定 bot。"""
         if not self.check_auth(r): return web.Response(status=403)
-        rd = await r.multipart(); tag = "未分类"
+        rd = await r.multipart()
+        tag = "未分类"
+        target_bot_raw = ""  # form 字段
         files_to_insert = []
 
         while True:
             p = await rd.next()
             if not p: break
             if p.name == "tags": tag = await p.text()
+            elif p.name == "bot_id": target_bot_raw = (await p.text() or "").strip()
             elif p.name == "file":
                 raw = await p.read()
                 comp, ext = await self._compress_image(raw)
@@ -1579,13 +1589,17 @@ class MemeMaster(Star):
                 h = await self._calc_hash_async(comp)
                 files_to_insert.append((fn, tag, h, time.time()))
 
+        # 解析 bot_id：global/空 → NULL；否则字符串
+        target_bot = None if target_bot_raw in ("", "global", "all", None) else target_bot_raw
+
         async with self.db_lock:
             conn = sqlite3.connect(self._db_path())
             try:
                 c = conn.cursor()
                 for row in files_to_insert:
                     try:
-                        c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at) VALUES (?, ?, 'manual', ?, ?)", row)
+                        c.execute("INSERT INTO memes (filename, tags, source, feature_hash, created_at, bot_id) VALUES (?, ?, 'manual', ?, ?, ?)",
+                                  (*row, target_bot))
                     except sqlite3.IntegrityError: pass
                 conn.commit()
             finally:
@@ -1625,62 +1639,305 @@ class MemeMaster(Star):
             conn.close()
 
     async def h_idx(self, r):
-        """首页：从数据库读取列表，而不是 self.data"""
+        """首页：从数据库读取列表 (含 bot_id 维度)。前端按需筛选/切换。"""
         if not self.check_auth(r): return web.Response(status=403, text="Need ?token=xxx")
 
         conn = sqlite3.connect(self._db_path())
         try:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            c.execute("SELECT filename, tags, source FROM memes ORDER BY created_at DESC")
+            c.execute("SELECT filename, tags, source, bot_id FROM memes ORDER BY created_at DESC")
             rows = c.fetchall()
         finally:
             conn.close()
-        
-        # 转成 dict 格式喂给前端 (兼容旧 html 结构)
-        # 结构: {"filename": {"tags": "xxx", "source": "manual"}, ...}
-        data_for_web = {row['filename']: {"tags": row['tags'], "source": row['source']} for row in rows}
-        
+
+        # 结构: {"filename": {"tags": "xxx", "source": "manual", "bot_id": null|str}, ...}
+        data_for_web = {row['filename']: {
+            "tags": row['tags'],
+            "source": row['source'],
+            "bot_id": row['bot_id'],
+        } for row in rows}
+
+        bots = self.list_bots()  # [{bot_id, nickname, ...}]
+
         token = self.local_config["web_token"]
-        html = self.read_file("index.html").replace("{{ MEME_DATA }}", json.dumps(data_for_web)).replace("admin123", token)
+        html = (self.read_file("index.html")
+                .replace("{{ MEME_DATA }}", json.dumps(data_for_web))
+                .replace("{{ BOTS_DATA }}", json.dumps(bots))
+                .replace("admin123", token))
         return web.Response(text=html, content_type="text/html")
-    async def h_gcf(self,r):
+    # === 配置 key 类型分类 (统一逻辑共用) ===
+    _STR_CONFIG_KEYS = {'web_token', 'ai_prompt', 'smtp_host', 'smtp_user',
+                        'smtp_pass', 'email_to', 'target_bot_id', 'typing_debounce'}
+
+    async def h_gcf(self, r):
+        """返回全局 local_config (兼容旧前端)。
+        新前端可加 ?bot_id=xxx 拿该 bot 的有效配置 (effective)。"""
         if not self.check_auth(r): return web.Response(status=403)
-        return web.json_response(self.local_config)
+        bot_id = (r.query.get("bot_id") or "").strip()
+        if not bot_id:
+            # 旧行为：返回全局 config
+            return web.json_response(self.local_config)
+        # 新行为：返回 {global, bot, effective}
+        return web.json_response({
+            "global": self.local_config,
+            "bot": self.get_all_bot_config(bot_id),
+            "effective": self.get_effective_bot_config(bot_id),
+            "global_keys": sorted(self.GLOBAL_CONFIG_KEYS),
+            "bot_keys": sorted(self.BOT_CONFIG_KEYS),
+        })
+
+    def _coerce_config_value(self, k, v):
+        """按 key 把入参规范化：字符串型 vs 浮点型"""
+        if k in self._STR_CONFIG_KEYS:
+            val = str(v) if v is not None else ""
+            if val.lower() == "none": val = ""
+            return val, True
+        # 浮点型
+        if v is None: return None, False
+        s = str(v).strip()
+        if s == "" or s.lower() == "none": return None, False
+        try:
+            return float(s), True
+        except Exception:
+            return None, False
 
     async def h_ucf(self, r):
+        """更新配置。
+        - 不带 ?bot_id=xxx：写入全局 local_config (兼容旧前端)。
+        - 带 ?bot_id=xxx：bot 级 key 写到该 bot 的 bot_configs；全局 key 仍写到 local_config。"""
         if not self.check_auth(r): return web.Response(status=403)
         try:
             new_conf = await r.json()
+            target_bot = (r.query.get("bot_id") or "").strip()
+            wrote_global = False
+
             for k, v in new_conf.items():
-                if k in ['web_token', 'ai_prompt', 'smtp_host', 'smtp_user', 'smtp_pass', 'email_to', 'target_bot_id', 'typing_debounce']:
-                    # 关键修复：如果 v 是 None 或者 字符串 "None"，就存为空字符串
-                    val = str(v) if v is not None else ""
-                    if val.lower() == "none": val = ""
-                    self.local_config[k] = val
+                norm, ok = self._coerce_config_value(k, v)
+                if not ok: continue
+
+                if target_bot and k in self.BOT_CONFIG_KEYS:
+                    # 写入 bot_configs 表
+                    self.set_bot_config(target_bot, k, norm)
+                elif k in self.GLOBAL_CONFIG_KEYS or not target_bot:
+                    # 全局 key、或没指定 bot 时：写到 local_config
+                    self.local_config[k] = norm
+                    wrote_global = True
                 else:
-                    try:
-                        if v is not None and str(v).strip() != "" and str(v).lower() != "none":
-                            self.local_config[k] = float(v)
-                    except: pass
-            self.save_config()
+                    # 已指定 bot 但 key 不在 BOT_CONFIG_KEYS / GLOBAL_CONFIG_KEYS：兜底为 bot 级
+                    self.set_bot_config(target_bot, k, norm)
+
+            if wrote_global:
+                self.save_config()
             return web.Response(text="ok")
         except Exception as e:
             return web.Response(status=500, text=str(e))
 
-    async def h_backup(self,r):
+    async def h_backup(self, r):
+        """备份接口。
+        - 不带 ?bot_id 或 ?bot_id=all：全量备份 (老行为)，含完整 db / 配置 / 全部图片。
+        - ?bot_id=xxx：导出该 bot 的子集 (该 bot 自有 memes 文件 + 全局 NULL memes + 该 bot 的 memories + bot_configs)，
+          打包成一个轻量级 zip (含一个 subset.db 和 images/ 子目录)。"""
         if not self.check_auth(r): return web.Response(status=403)
-        b=io.BytesIO()
-        with zipfile.ZipFile(b,'w',zipfile.ZIP_DEFLATED) as z:
-            for root,_,files in os.walk(self.img_dir): 
-                for f in files: z.write(os.path.join(root,f),f"images/{f}")
-            if os.path.exists(self.data_file): z.write(self.data_file,"memes.json")
-            if os.path.exists(self.config_file): z.write(self.config_file,"config.json")
-            if os.path.exists(self.buffer_file): z.write(self.buffer_file, "buffer.json")
-            db_p = os.path.join(self.base_dir, "meme_core.db")
-            if os.path.exists(db_p): z.write(db_p, "meme_core.db")
+        bot_id = (r.query.get("bot_id") or "").strip()
+        b = io.BytesIO()
+
+        if not bot_id or bot_id == "all":
+            # 全量备份 (兼容老行为)
+            with zipfile.ZipFile(b, 'w', zipfile.ZIP_DEFLATED) as z:
+                for root, _, files in os.walk(self.img_dir):
+                    for f in files: z.write(os.path.join(root, f), f"images/{f}")
+                if os.path.exists(self.data_file): z.write(self.data_file, "memes.json")
+                if os.path.exists(self.config_file): z.write(self.config_file, "config.json")
+                if os.path.exists(self.buffer_file): z.write(self.buffer_file, "buffer.json")
+                db_p = os.path.join(self.base_dir, "meme_core.db")
+                if os.path.exists(db_p): z.write(db_p, "meme_core.db")
+            fname = "meme_backup_all.zip"
+        else:
+            # 单 bot 子集备份
+            fname = f"meme_backup_{bot_id}.zip"
+            subset_db_buf = io.BytesIO()
+            # 用内存 sqlite 装子集
+            mem_conn = sqlite3.connect(":memory:")
+            try:
+                src = sqlite3.connect(self._db_path())
+                try:
+                    src.row_factory = sqlite3.Row
+                    sc = src.cursor()
+                    mc = mem_conn.cursor()
+                    # 复制表结构 (简化版：仅 memes / memories / bot_configs / bots)
+                    mc.executescript("""
+                        CREATE TABLE memes (filename TEXT PRIMARY KEY, tags TEXT, feature_hash TEXT,
+                            source TEXT, created_at REAL, last_used REAL, usage_count INTEGER, bot_id TEXT);
+                        CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT,
+                            keywords TEXT, type TEXT, importance INTEGER, created_at REAL, bot_id TEXT);
+                        CREATE TABLE bot_configs (bot_id TEXT, key TEXT, value TEXT, PRIMARY KEY (bot_id, key));
+                        CREATE TABLE bots (bot_id TEXT PRIMARY KEY, nickname TEXT, created_at REAL, last_active REAL);
+                    """)
+                    # 该 bot + 全局 NULL 的 memes
+                    sc.execute("SELECT * FROM memes WHERE bot_id IS NULL OR bot_id=?", (bot_id,))
+                    meme_rows = [dict(x) for x in sc.fetchall()]
+                    for row in meme_rows:
+                        mc.execute("INSERT INTO memes (filename, tags, feature_hash, source, created_at, last_used, usage_count, bot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                   (row.get('filename'), row.get('tags'), row.get('feature_hash'),
+                                    row.get('source'), row.get('created_at'), row.get('last_used') or 0,
+                                    row.get('usage_count') or 0, row.get('bot_id')))
+                    # 该 bot 的 memories
+                    sc.execute("SELECT * FROM memories WHERE bot_id=?", (bot_id,))
+                    for row in [dict(x) for x in sc.fetchall()]:
+                        mc.execute("INSERT INTO memories (content, keywords, type, importance, created_at, bot_id) VALUES (?, ?, ?, ?, ?, ?)",
+                                   (row.get('content'), row.get('keywords'), row.get('type'),
+                                    row.get('importance') or 1, row.get('created_at'), row.get('bot_id')))
+                    # 该 bot 的配置 + bots 行
+                    sc.execute("SELECT bot_id, key, value FROM bot_configs WHERE bot_id=?", (bot_id,))
+                    for r2 in sc.fetchall(): mc.execute("INSERT INTO bot_configs VALUES (?, ?, ?)", tuple(r2))
+                    sc.execute("SELECT bot_id, nickname, created_at, last_active FROM bots WHERE bot_id=?", (bot_id,))
+                    for r2 in sc.fetchall(): mc.execute("INSERT INTO bots VALUES (?, ?, ?, ?)", tuple(r2))
+                    mem_conn.commit()
+                finally:
+                    src.close()
+                # dump 内存 db 到字节
+                subset_db_path = os.path.join(self.base_dir, f"_subset_{bot_id}_{int(time.time())}.db")
+                file_conn = sqlite3.connect(subset_db_path)
+                try:
+                    mem_conn.backup(file_conn)
+                finally:
+                    file_conn.close()
+                with open(subset_db_path, "rb") as f: subset_db_bytes = f.read()
+                try: os.remove(subset_db_path)
+                except: pass
+            finally:
+                mem_conn.close()
+
+            # 打包：subset.db + 该 bot 涉及的图片 (含全局)
+            referenced = {row['filename'] for row in meme_rows}
+            with zipfile.ZipFile(b, 'w', zipfile.ZIP_DEFLATED) as z:
+                z.writestr("meme_core.db", subset_db_bytes)
+                # 备份元信息
+                z.writestr("backup_info.json", json.dumps({
+                    "bot_id": bot_id, "kind": "single_bot",
+                    "exported_at": time.time(), "meme_count": len(referenced),
+                }, ensure_ascii=False, indent=2))
+                for f in referenced:
+                    p = os.path.join(self.img_dir, f)
+                    if os.path.exists(p): z.write(p, f"images/{f}")
+
         b.seek(0)
-        return web.Response(body=b, headers={'Content-Disposition':'attachment; filename="meme_backup.zip"'})
+        return web.Response(body=b, headers={'Content-Disposition': f'attachment; filename="{fname}"'})
+
+    # === 多 Bot 管理 API ===
+    async def h_bots_list(self, r):
+        """列出所有已注册的 bot (含自动注册的)。"""
+        if not self.check_auth(r): return web.Response(status=403)
+        bots = self.list_bots()
+        # 顺带统计每个 bot 的 meme/memory 数
+        try:
+            conn = sqlite3.connect(self._db_path())
+            try:
+                c = conn.cursor()
+                for b in bots:
+                    bid = b["bot_id"]
+                    c.execute("SELECT COUNT(*) FROM memes WHERE bot_id=?", (bid,))
+                    b["meme_count"] = c.fetchone()[0]
+                    c.execute("SELECT COUNT(*) FROM memories WHERE bot_id=?", (bid,))
+                    b["memory_count"] = c.fetchone()[0]
+                # 全局共享池数量 (展示用)
+                c.execute("SELECT COUNT(*) FROM memes WHERE bot_id IS NULL")
+                global_meme = c.fetchone()[0]
+            finally:
+                conn.close()
+        except Exception:
+            global_meme = 0
+        return web.json_response({"bots": bots, "global_meme_count": global_meme})
+
+    async def h_bots_rename(self, r):
+        """重命名 bot 昵称 (不改 bot_id)。"""
+        if not self.check_auth(r): return web.Response(status=403)
+        d = await r.json()
+        bid = (d.get("bot_id") or "").strip()
+        nick = (d.get("nickname") or "").strip()
+        if not bid or not nick: return web.json_response({"ok": False, "msg": "missing bot_id or nickname"})
+        try:
+            conn = sqlite3.connect(self._db_path(), timeout=5)
+            try:
+                c = conn.cursor()
+                c.execute("UPDATE bots SET nickname=? WHERE bot_id=?", (nick, bid))
+                conn.commit()
+            finally:
+                conn.close()
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"ok": False, "msg": str(e)})
+
+    async def h_bots_delete(self, r):
+        """彻底删除一个 bot 及其归属的 memories / memes / 配置 (危险操作)。
+        全局 NULL memes 不会被删。"""
+        if not self.check_auth(r): return web.Response(status=403)
+        d = await r.json()
+        bid = (d.get("bot_id") or "").strip()
+        if not bid: return web.json_response({"ok": False, "msg": "missing bot_id"})
+        if bid == self.DEFAULT_BOT_ID:
+            return web.json_response({"ok": False, "msg": "默认 bot 不可删除"})
+        try:
+            async with self.db_lock:
+                conn = sqlite3.connect(self._db_path(), timeout=10)
+                try:
+                    c = conn.cursor()
+                    # 先把该 bot 的 memes 文件物理删除
+                    c.execute("SELECT filename FROM memes WHERE bot_id=?", (bid,))
+                    for (fn,) in c.fetchall():
+                        try: os.remove(os.path.join(self.img_dir, fn))
+                        except: pass
+                    c.execute("DELETE FROM memes WHERE bot_id=?", (bid,))
+                    c.execute("DELETE FROM memories WHERE bot_id=?", (bid,))
+                    c.execute("DELETE FROM bot_configs WHERE bot_id=?", (bid,))
+                    c.execute("DELETE FROM bots WHERE bot_id=?", (bid,))
+                    conn.commit()
+                finally:
+                    conn.close()
+            # 内存态也清理
+            self.chat_history_buffers.pop(bid, None)
+            self.last_active_times.pop(bid, None)
+            self.last_uids.pop(bid, None)
+            self.last_session_ids.pop(bid, None)
+            self.last_auto_save_times.pop(bid, None)
+            self.summarizing_bots.discard(bid)
+            self.save_buffer_to_disk()
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"ok": False, "msg": str(e)})
+
+    async def h_bot_config_get(self, r):
+        """获取某 bot 的有效配置 (bot 覆盖 + 全局兜底)。"""
+        if not self.check_auth(r): return web.Response(status=403)
+        bid = (r.query.get("bot_id") or self.DEFAULT_BOT_ID).strip() or self.DEFAULT_BOT_ID
+        return web.json_response({
+            "bot_id": bid,
+            "overrides": self.get_all_bot_config(bid),
+            "effective": self.get_effective_bot_config(bid),
+            "bot_keys": sorted(self.BOT_CONFIG_KEYS),
+        })
+
+    async def h_bot_config_set(self, r):
+        """批量设置某 bot 的配置 (仅 BOT_CONFIG_KEYS)。
+        Body: {"bot_id": "xxx", "config": {...}}"""
+        if not self.check_auth(r): return web.Response(status=403)
+        try:
+            d = await r.json()
+            bid = (d.get("bot_id") or "").strip() or self.DEFAULT_BOT_ID
+            cfg = d.get("config") or {}
+            if not isinstance(cfg, dict):
+                return web.json_response({"ok": False, "msg": "config must be object"})
+            written = 0
+            for k, v in cfg.items():
+                if k not in self.BOT_CONFIG_KEYS: continue
+                norm, ok = self._coerce_config_value(k, v)
+                if ok:
+                    self.set_bot_config(bid, k, norm)
+                    written += 1
+            return web.json_response({"ok": True, "written": written})
+        except Exception as e:
+            return web.json_response({"ok": False, "msg": str(e)})
 
     async def h_restore(self, r):
         if not self.check_auth(r): return web.Response(status=403)
@@ -1754,12 +2011,17 @@ class MemeMaster(Star):
             return web.Response(status=500, text=f"Server Error: {str(e)}")
 
     async def h_get_stickies(self, r):
+        """获取 sticky 列表。支持 ?bot_id=xxx 或 ?bot_id=all (默认 all 含所有 bot)。"""
         if not self.check_auth(r): return web.Response(status=403)
+        bid = (r.query.get("bot_id") or "all").strip()
         conn = sqlite3.connect(self._db_path())
         try:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-            c.execute("SELECT id, content, created_at FROM memories WHERE type='sticky' ORDER BY created_at DESC")
+            if bid and bid != "all":
+                c.execute("SELECT id, content, created_at, bot_id FROM memories WHERE type='sticky' AND bot_id=? ORDER BY created_at DESC", (bid,))
+            else:
+                c.execute("SELECT id, content, created_at, bot_id FROM memories WHERE type='sticky' ORDER BY created_at DESC")
             rows = [dict(ix) for ix in c.fetchall()]
             return web.json_response(rows)
         finally:
@@ -1826,46 +2088,53 @@ class MemeMaster(Star):
         return web.Response(text=res)
 
     async def h_meme_count(self, r):
+        """统计图片数。?bot_id=xxx 表示该 bot 视角 (NULL∪bot)；?bot_id=all 全部；不传 = 全部。"""
         if not self.check_auth(r): return web.Response(status=403)
+        bid = (r.query.get("bot_id") or "all").strip()
         conn = sqlite3.connect(self._db_path())
         try:
             c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM memes")
+            if bid and bid != "all":
+                c.execute("SELECT COUNT(*) FROM memes WHERE bot_id IS NULL OR bot_id=?", (bid,))
+            else:
+                c.execute("SELECT COUNT(*) FROM memes")
             count = c.fetchone()[0]
-            return web.json_response({"count": count})
+            return web.json_response({"count": count, "bot_id": bid})
         finally:
             conn.close()
 
     # === DB Management Endpoints ===
     async def h_db_list(self, r):
-        """列出 memories 表记录 (分页 + 类型筛选 + 搜索)"""
+        """列出 memories 表记录 (分页 + 类型筛选 + 搜索 + bot 筛选)"""
         if not self.check_auth(r): return web.Response(status=403)
         mem_type = r.query.get("type", "dialogue")  # dialogue/fragment/sticky
         page = int(r.query.get("page", 1))
         search = r.query.get("search", "").strip()
+        bid = (r.query.get("bot_id") or "all").strip()
         page_size = 30
         offset = (page - 1) * page_size
-        
+
+        # 动态拼 WHERE
+        where = ["type=?"]
+        params = [mem_type]
+        if bid and bid != "all":
+            where.append("bot_id=?")
+            params.append(bid)
+        if search:
+            where.append("content LIKE ?")
+            params.append(f"%{search}%")
+        where_sql = " AND ".join(where)
+
         conn = sqlite3.connect(self._db_path())
         try:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
-
-            if search:
-                c.execute("SELECT COUNT(*) FROM memories WHERE type=? AND content LIKE ?", (mem_type, f"%{search}%"))
-            else:
-                c.execute("SELECT COUNT(*) FROM memories WHERE type=?", (mem_type,))
+            c.execute(f"SELECT COUNT(*) FROM memories WHERE {where_sql}", params)
             total = c.fetchone()[0]
-
-            if search:
-                c.execute("SELECT id, content, keywords, created_at FROM memories WHERE type=? AND content LIKE ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                         (mem_type, f"%{search}%", page_size, offset))
-            else:
-                c.execute("SELECT id, content, keywords, created_at FROM memories WHERE type=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                         (mem_type, page_size, offset))
+            c.execute(f"SELECT id, content, keywords, created_at, bot_id FROM memories WHERE {where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                      (*params, page_size, offset))
             rows = [{"id": r["id"], "content": r["content"], "keywords": r["keywords"] or "",
-                     "created_at": r["created_at"]} for r in c.fetchall()]
-
+                     "created_at": r["created_at"], "bot_id": r["bot_id"]} for r in c.fetchall()]
             return web.json_response({"total": total, "page": page, "page_size": page_size, "rows": rows})
         finally:
             conn.close()
