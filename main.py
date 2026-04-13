@@ -115,6 +115,23 @@ class MemeMaster(Star):
 
     DEFAULT_BOT_ID = "default"
 
+    # === v3.0: 配置作用域分类 ===
+    # 全局配置 (config.json)：所有 bot 共享；不在数据库 bot_configs 表里
+    GLOBAL_CONFIG_KEYS = {
+        "web_token", "web_port",
+        "smtp_host", "smtp_user", "smtp_pass", "email_to",
+        "target_bot_id",
+    }
+    # Bot 级配置 (bot_configs 表)：每个 bot 独立；如未设置则回退 local_config 同名 key
+    BOT_CONFIG_KEYS = {
+        "ai_prompt",
+        "debounce_time", "typing_debounce",
+        "delay_base", "delay_factor",
+        "ab_context_rounds",
+        "proactive_interval", "quiet_start", "quiet_end",
+        "auto_save_cooldown", "meme_match_threshold",
+    }
+
     def init_db(self):
         """初始化 SQLite 数据库 (v3.0 多 Bot 支持)"""
         db_path = os.path.join(self.base_dir, "meme_core.db")
@@ -294,7 +311,7 @@ class MemeMaster(Star):
             print(f"❌ [Bot Config] 写入失败 {bot_id}.{key}: {e}", flush=True)
 
     def get_all_bot_config(self, bot_id: str):
-        """读取某个 bot 的所有配置 (返回 dict)"""
+        """读取某个 bot 的所有配置 (返回 dict)，只含 bot_configs 里实际存了的"""
         if not bot_id: bot_id = self.DEFAULT_BOT_ID
         result = {}
         try:
@@ -308,6 +325,19 @@ class MemeMaster(Star):
                 conn.close()
         except Exception:
             pass
+        return result
+
+    def get_effective_bot_config(self, bot_id: str):
+        """返回某 bot 的"有效"配置 (默认值 ← local_config ← bot_configs 三层覆盖)
+        只包含 BOT_CONFIG_KEYS 列出的字段。"""
+        if not bot_id: bot_id = self.DEFAULT_BOT_ID
+        overrides = self.get_all_bot_config(bot_id)
+        result = {}
+        for k in self.BOT_CONFIG_KEYS:
+            if k in overrides:
+                result[k] = overrides[k]
+            elif k in self.local_config:
+                result[k] = self.local_config[k]
         return result
 
 
@@ -574,8 +604,10 @@ class MemeMaster(Star):
         """防抖计时器: 支持正在输入延长。v3.0: 按 (bot_id, user_id) 查 typing 状态。"""
         try:
             await asyncio.sleep(duration)
-            # 智能延长: 仅在启用输入检测时生效
-            if self.local_config.get("typing_debounce", "off").strip().lower() in ["on", "1", "true", "开"]:
+            # 智能延长: 仅在启用输入检测时生效 (按 bot 取配置)
+            td_val = str(self.get_bot_config(bot_id or self.DEFAULT_BOT_ID, "typing_debounce",
+                                             self.local_config.get("typing_debounce", "off"))).strip().lower()
+            if td_val in ["on", "1", "true", "开"]:
                 typing_times = self._typing_times
                 # 兼容老式调用 (没传 bot_id/user_id 时尝试从 sess_key 解析)
                 if user_id is None:
@@ -613,16 +645,18 @@ class MemeMaster(Star):
     @filter.event_message_type(EventMessageType.ALL, priority=99)
     async def notice_handler(self, event: AstrMessageEvent):
         try:
-            # 未开启则跳过
-            if self.local_config.get("typing_debounce", "off").strip().lower() not in ["on", "1", "true", "开"]:
-                return
             raw = getattr(event.message_obj, 'raw_message', None)
             if not isinstance(raw, dict) or raw.get('post_type') != 'notice':
                 return
             if raw.get('notice_type') == 'notify' and raw.get('sub_type') == 'input_status':
+                bot_id = self._bot_id_from_event(event)
+                # 当前 bot 未开启输入检测则跳过
+                td_val = str(self.get_bot_config(bot_id, "typing_debounce",
+                                                 self.local_config.get("typing_debounce", "off"))).strip().lower()
+                if td_val not in ["on", "1", "true", "开"]:
+                    return
                 uid = str(raw.get('user_id', ''))
                 if uid:
-                    bot_id = self._bot_id_from_event(event)
                     self._typing_times[(bot_id, uid)] = time.time()
                     print(f"⌨️ [Typing] bot={bot_id} 用户 {uid} 正在输入", flush=True)
         except Exception:
@@ -692,9 +726,10 @@ class MemeMaster(Star):
             self.last_uids[bot_id] = uid
             self.last_session_ids[bot_id] = event.session_id
 
-            # 自动进货 (按 bot 各自维护冷却)
+            # 自动进货 (按 bot 各自维护冷却 + 各自配置)
             if img_urls:
-                cd = float(self.local_config.get("auto_save_cooldown", 60))
+                cd = float(self.get_bot_config(bot_id, "auto_save_cooldown",
+                                               self.local_config.get("auto_save_cooldown", 60)))
                 last_save = self.last_auto_save_times.get(bot_id, 0)
                 if now_ts - last_save > cd:
                     self.last_auto_save_times[bot_id] = now_ts
@@ -738,7 +773,9 @@ class MemeMaster(Star):
             if msg_str.startswith("/"):
                 setattr(event, "__meme_skipped", True)
                 return
-            try: debounce_time = float(self.local_config.get("debounce_time", 3.0))
+            try:
+                debounce_time = float(self.get_bot_config(bot_id, "debounce_time",
+                                                          self.local_config.get("debounce_time", 3.0)))
             except: debounce_time = 3.0
             print(f"🔧 [Meme] 防抖值: {debounce_time}", flush=True)  # ← 加这行
 
@@ -1179,7 +1216,7 @@ class MemeMaster(Star):
                     print("❌ [自动进货] 错误: 无法获取 AI Provider")
                     return
 
-                raw_prompt = self.local_config.get("ai_prompt", "")
+                raw_prompt = self.get_bot_config(bot_id, "ai_prompt", self.local_config.get("ai_prompt", ""))
                 prompt = raw_prompt.replace("{context_text}", context_text) if "{context_text}" in raw_prompt else raw_prompt
 
                 resp = await provider.text_chat(prompt, session_id=None, image_urls=[img_url])
@@ -1421,7 +1458,8 @@ class MemeMaster(Star):
             return os.path.join(self.img_dir, row[0])
 
         # 2. 如果库里没查到，再遍历 self.data (legacy 兼容，不区分 bot)
-        threshold = float(self.local_config.get("meme_match_threshold", 0.3))
+        threshold = float(self.get_bot_config(bot_id, "meme_match_threshold",
+                                              self.local_config.get("meme_match_threshold", 0.3)))
         best, score = None, 0
         for f, i in self.data.items():
             t = i.get("tags", "")
