@@ -619,18 +619,44 @@ class MemeMaster(Star):
     # ==========================
     # 主逻辑
     # ==========================
+    def _current_bot_info(self, event):
+        """从事件中提取当前 bot_id 和 nickname，返回 (bot_id, nickname)。
+        提取不到时返回 (DEFAULT_BOT_ID, '默认 Bot')，保证下游永远拿到一个有效 bot_id。"""
+        try:
+            if hasattr(self.context, 'get_current_provider_bot'):
+                bot = self.context.get_current_provider_bot()
+                if bot and getattr(bot, 'self_id', None):
+                    bot_id = str(bot.self_id)
+                    # AstrBot 的 bot 对象可能挂载 nickname/name/self_nickname
+                    nickname = (getattr(bot, 'nickname', None)
+                                or getattr(bot, 'name', None)
+                                or getattr(bot, 'self_nickname', None)
+                                or bot_id)
+                    return bot_id, str(nickname)
+        except Exception:
+            pass
+        return self.DEFAULT_BOT_ID, "默认 Bot"
+
+    def _bot_id_from_event(self, event):
+        """便捷方法：只取 bot_id"""
+        return self._current_bot_info(event)[0]
+
     async def _master_handler(self, event: AstrMessageEvent):
-        # 1. 基础防爆 & 自检 (保持不变)
+        # 1. 基础防爆 & 自检
         try:
             user_id = str(event.message_obj.sender.user_id)
             if hasattr(self.context, 'get_current_provider_bot'):
                 bot = self.context.get_current_provider_bot()
                 if bot and user_id == str(bot.self_id): return
-                
+
                 # 机器人白名单验证：如果配置了目标bot且当前bot不符，跳过
                 target_bot = self.local_config.get("target_bot_id", "").strip()
                 if target_bot and bot and str(bot.self_id) != target_bot:
                     return
+
+            # 自动注册当前 bot
+            bot_id, nickname = self._current_bot_info(event)
+            self.register_bot(bot_id, nickname)
         except Exception as e:
             print(f"⚠️ [Meme] bot_id 检测失败: {e}", flush=True)
 
