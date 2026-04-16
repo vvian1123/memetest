@@ -775,16 +775,16 @@ class MemeMaster(Star):
                 event.stop_event()
                 return
 
-            # 指令穿透: 其他命令消息不走我们的处理流程
+            # 指令穿透: 命令消息不走我们的处理流程，也不让事件继续传给 LLM handler
             cmd_prefixes = ["/", "！", "!"]
             if msg_str and any(msg_str.startswith(p) for p in cmd_prefixes) and not img_urls:
                 if sess_key in self.sessions: self.sessions[sess_key]['flush_event'].set()
-                setattr(event, "__meme_skipped", True)
+                event.stop_event()
                 return
 
             # "/" 开头兜底
             if msg_str.startswith("/"):
-                setattr(event, "__meme_skipped", True)
+                event.stop_event()
                 return
             try:
                 debounce_time = float(self.get_bot_config(bot_id, "debounce_time",
