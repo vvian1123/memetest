@@ -821,8 +821,7 @@ class MemeMaster(Star):
 
             if _is_cmd and not img_urls:
                 print(f"🚫 [Meme] 检测到命令, 跳过: raw={_raw_text[:20]!r}", flush=True)
-                if sess_key in self.sessions:
-                    self.sessions[sess_key]['flush_event'].set()
+                # 不触碰 session/flush_event: 命令不应打断正在进行的防抖
                 # 不 stop_event: 让 AstrBot 自己的命令处理器正常响应
                 return
             try:
