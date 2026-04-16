@@ -251,13 +251,18 @@ class MemeMaster(Star):
     # Bot 注册 / 配置 (v3.0)
     # ==========================
     def list_bots(self):
-        """列出所有已注册的 bot"""
+        """列出所有已注册的 bot (附带 meme/memory 统计)"""
         try:
             conn = sqlite3.connect(self._db_path(), timeout=5)
             try:
                 conn.row_factory = sqlite3.Row
                 c = conn.cursor()
-                c.execute("SELECT bot_id, nickname, created_at, last_active FROM bots ORDER BY created_at ASC")
+                c.execute("""
+                    SELECT b.bot_id, b.nickname, b.created_at, b.last_active,
+                           (SELECT COUNT(*) FROM memes WHERE bot_id = b.bot_id) AS meme_count,
+                           (SELECT COUNT(*) FROM memories WHERE bot_id = b.bot_id AND type != 'sticky') AS memory_count
+                    FROM bots b ORDER BY b.created_at ASC
+                """)
                 return [dict(r) for r in c.fetchall()]
             finally:
                 conn.close()
