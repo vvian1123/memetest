@@ -645,6 +645,37 @@ class MemeMaster(Star):
         except asyncio.CancelledError:
             pass
 
+    # === /撤回 命令：用 AstrBot 原生 @filter.command 注册 ===
+    # 这样只有真正输入 /撤回 才会触发，普通聊天提到 "撤回" 不会误触
+    @filter.command("撤回")
+    async def cmd_recall(self, event: AstrMessageEvent):
+        bot_id = self._bot_id_from_event(event)
+        uid = event.unified_msg_origin
+        sess_key = f"{bot_id}::{uid}"
+        has_pending = False
+        recalled_content = ""
+        if sess_key in self.sessions and self.sessions[sess_key]['queue']:
+            has_pending = True
+            last_item = self.sessions[sess_key]['queue'].pop()
+            recalled_content = last_item.get('content', '[图片]') if last_item.get('type') == 'text' else '[图片]'
+            if not self.sessions[sess_key]['queue']:
+                timer = self.sessions[sess_key].get('timer_task')
+                if timer: timer.cancel()
+                self.sessions[sess_key]['flush_event'].set()
+        if has_pending:
+            msg = f"✅ 已撤回: {recalled_content}"
+        else:
+            msg = "⚠️ 当前没有正在输入的待发消息可以撤回"
+        print(f"🚫 [Meme] /撤回 命令已处理: {msg}", flush=True)
+        yield event.plain_result(msg)
+        event.stop_event()
+
+    @filter.command("undo")
+    async def cmd_undo(self, event: AstrMessageEvent):
+        # 复用 /撤回 逻辑
+        async for result in self.cmd_recall(event):
+            yield result
+
     @filter.event_message_type(EventMessageType.PRIVATE_MESSAGE, priority=1)
     async def handle_private(self, event: AstrMessageEvent):
         await self._master_handler(event)
@@ -750,66 +781,49 @@ class MemeMaster(Star):
                         # 传入 msg_str 作为上下文，bot_id 决定写入哪个 bot 的图库
                         asyncio.create_task(self.ai_evaluate_image(url, msg_str, bot_id=bot_id))
 
-            # ═══ 命令检测 ═══
-            # AstrBot 会剥离消息中的 "/" 前缀再传给插件，
-            # 所以 event.message_str 收到的是 "help" 而非 "/help"。
-            # 需要同时匹配有无 "/" 的版本。
+            # ═══ 命令检测 (通用斜杠命令穿透) ═══
+            # /撤回 和 /undo 已通过 @filter.command 注册，不会到这里。
+            # 这里只需要拦截所有其他 "/" 命令 (如 /help, /plugin 等)。
+            #
+            # 核心策略: 从多个来源探测消息是否原本以 "/" 开头，
+            # 不维护命令列表，而是直接检查原始文本。
 
-            # 尝试从原始消息获取未剥离的文本
+            # --- 探测原始消息文本 ---
             _raw_text = ""
+            # 来源1: message_obj.raw_message (平台适配器的原始消息)
             try:
                 _rm = getattr(event.message_obj, 'raw_message', None)
                 if isinstance(_rm, str):
                     _raw_text = _rm.strip()
             except Exception:
                 pass
+            # 来源2: 消息链第一个 Plain 段的文本
+            if not _raw_text:
+                try:
+                    for _seg in event.message_obj.message:
+                        if isinstance(_seg, Plain) and _seg.text:
+                            _raw_text = _seg.text.strip()
+                            break
+                except Exception:
+                    pass
 
-            msg_lower = msg_str.lower().strip()
+            # 诊断日志: 帮助确认 raw_message 是否保留了 "/" 前缀
+            # 部署后发一条 /help 看日志，确认 _raw_text 是 "/help" 还是 "help"
+            print(f"🔍 [Meme] msg_str={msg_str[:20]!r}, raw_text={_raw_text[:30]!r}", flush=True)
 
-            # === /撤回 命令：撤回刚刚输入的一句话 ===
-            if msg_lower in ["撤回", "undo", "/撤回", "/undo"]:
-                has_pending = False
-                recalled_content = ""
-                if sess_key in self.sessions and self.sessions[sess_key]['queue']:
-                    has_pending = True
-                    last_item = self.sessions[sess_key]['queue'].pop()
-                    recalled_content = last_item.get('content', '[图片]') if last_item.get('type') == 'text' else '[图片]'
-
-                    if not self.sessions[sess_key]['queue']:
-                        timer = self.sessions[sess_key].get('timer_task')
-                        if timer: timer.cancel()
-                        self.sessions[sess_key]['flush_event'].set()
-
-                setattr(event, "__meme_skipped", True)
-                if has_pending:
-                    msg = f"✅ 已撤回: {recalled_content}"
-                else:
-                    msg = "⚠️ 当前没有正在输入的待发消息可以撤回"
-                event.set_result(MessageEventResult().message(msg))
-                event.stop_event()
-                print(f"🚫 [Meme] 撤回命令已处理: {msg}", flush=True)
-                return
-
-            # === 指令穿透: 命令消息不走我们的处理流程 ===
-            _ASTRBOT_CMDS = {"help", "status", "plugin", "t2i", "wake", "sleep",
-                             "provider", "reset", "sid", "myid", "model", "key",
-                             "persona", "dashboard", "update", "reboot", "websearch"}
             _is_cmd = False
-            # 方式1: raw_message 保留了原始 "/" 前缀
+            # 方式1: raw_message / Plain 段保留了 "/" 前缀 (最可靠)
             if _raw_text and _raw_text.startswith("/"):
                 _is_cmd = True
-            # 方式2: 匹配已知 AstrBot 内置命令 (无前缀版本)
-            elif msg_lower and msg_lower.split()[0] in _ASTRBOT_CMDS:
-                _is_cmd = True
-            # 方式3: "!" / "！" / "/" 前缀 (后者作为兜底)
-            elif msg_str and any(msg_str.startswith(p) for p in ["！", "!", "/"]):
+            # 方式2: message_str 本身仍有 "/"、"!" 或 "！" 前缀
+            elif msg_str and any(msg_str.startswith(p) for p in ["/", "！", "!"]):
                 _is_cmd = True
 
             if _is_cmd and not img_urls:
-                print(f"🚫 [Meme] 检测到命令, 跳过: {msg_str[:20]}", flush=True)
+                print(f"🚫 [Meme] 检测到命令, 跳过: raw={_raw_text[:20]!r}", flush=True)
                 if sess_key in self.sessions:
                     self.sessions[sess_key]['flush_event'].set()
-                # 不 stop_event: 让 AstrBot 自己的命令处理器能正常响应
+                # 不 stop_event: 让 AstrBot 自己的命令处理器正常响应
                 return
             try:
                 debounce_time = float(self.get_bot_config(bot_id, "debounce_time",
