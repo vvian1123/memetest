@@ -184,7 +184,6 @@ class MemeMaster(Star):
         )''')
 
         # === Schema 迁移：给 memes 和 memories 加 bot_id 列 ===
-        # memes.bot_id: NULL = 全局共享 (手动上传)，否则归属某 bot (自动进货)
         c.execute("PRAGMA table_info(memes)")
         meme_cols = [row[1] for row in c.fetchall()]
         if "bot_id" not in meme_cols:
@@ -192,14 +191,23 @@ class MemeMaster(Star):
             c.execute("CREATE INDEX IF NOT EXISTS idx_memes_bot ON memes(bot_id);")
             print("📦 [Meme] memes 表已升级 (新增 bot_id 列)", flush=True)
 
-        # memories.bot_id: 必填，旧数据迁移到 default bot
         c.execute("PRAGMA table_info(memories)")
         memo_cols = [row[1] for row in c.fetchall()]
         if "bot_id" not in memo_cols:
             c.execute("ALTER TABLE memories ADD COLUMN bot_id TEXT")
-            c.execute(f"UPDATE memories SET bot_id = '{self.DEFAULT_BOT_ID}' WHERE bot_id IS NULL")
             c.execute("CREATE INDEX IF NOT EXISTS idx_memories_bot ON memories(bot_id);")
-            print("📦 [Meme] memories 表已升级 (旧数据归入 default bot)", flush=True)
+            print("📦 [Meme] memories 表已升级 (新增 bot_id 列)", flush=True)
+
+        # === 一次性迁移：把所有 bot_id=NULL 的旧数据归入 default bot ===
+        # (幂等：用 system_config 打标记，恢复旧备份后也能重跑)
+        c.execute("SELECT value FROM system_config WHERE key='null_to_default_migrated'")
+        migrated = c.fetchone()
+        if not migrated:
+            n_memes = c.execute(f"UPDATE memes SET bot_id = ? WHERE bot_id IS NULL", (self.DEFAULT_BOT_ID,)).rowcount
+            n_memos = c.execute(f"UPDATE memories SET bot_id = ? WHERE bot_id IS NULL", (self.DEFAULT_BOT_ID,)).rowcount
+            c.execute("INSERT OR REPLACE INTO system_config (key, value) VALUES ('null_to_default_migrated', '1')")
+            if n_memes or n_memos:
+                print(f"📦 [Meme] 旧数据已归入 default bot: {n_memes} 张图 + {n_memos} 条记忆", flush=True)
 
         # 确保 default bot 始终存在 (兜底)
         c.execute("INSERT OR IGNORE INTO bots (bot_id, nickname, created_at, last_active) VALUES (?, ?, ?, ?)",
