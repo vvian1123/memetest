@@ -750,17 +750,31 @@ class MemeMaster(Star):
                         # 传入 msg_str 作为上下文，bot_id 决定写入哪个 bot 的图库
                         asyncio.create_task(self.ai_evaluate_image(url, msg_str, bot_id=bot_id))
 
+            # ═══ 命令检测 ═══
+            # AstrBot 会剥离消息中的 "/" 前缀再传给插件，
+            # 所以 event.message_str 收到的是 "help" 而非 "/help"。
+            # 需要同时匹配有无 "/" 的版本。
+
+            # 尝试从原始消息获取未剥离的文本
+            _raw_text = ""
+            try:
+                _rm = getattr(event.message_obj, 'raw_message', None)
+                if isinstance(_rm, str):
+                    _raw_text = _rm.strip()
+            except Exception:
+                pass
+
+            msg_lower = msg_str.lower().strip()
+
             # === /撤回 命令：撤回刚刚输入的一句话 ===
-            if msg_str in ["/撤回", "/undo"]:
+            if msg_lower in ["撤回", "undo", "/撤回", "/undo"]:
                 has_pending = False
                 recalled_content = ""
                 if sess_key in self.sessions and self.sessions[sess_key]['queue']:
                     has_pending = True
-                    # 只移除队列里的最后一条消息
                     last_item = self.sessions[sess_key]['queue'].pop()
                     recalled_content = last_item.get('content', '[图片]') if last_item.get('type') == 'text' else '[图片]'
 
-                    # 如果撤回后队列空了，说明全撤回了，取消计时器和 AI 请求
                     if not self.sessions[sess_key]['queue']:
                         timer = self.sessions[sess_key].get('timer_task')
                         if timer: timer.cancel()
@@ -773,18 +787,29 @@ class MemeMaster(Star):
                     msg = "⚠️ 当前没有正在输入的待发消息可以撤回"
                 event.set_result(MessageEventResult().message(msg))
                 event.stop_event()
+                print(f"🚫 [Meme] 撤回命令已处理: {msg}", flush=True)
                 return
 
-            # 指令穿透: 命令消息不走我们的处理流程，也不让事件继续传给 LLM handler
-            cmd_prefixes = ["/", "！", "!"]
-            if msg_str and any(msg_str.startswith(p) for p in cmd_prefixes) and not img_urls:
-                if sess_key in self.sessions: self.sessions[sess_key]['flush_event'].set()
-                event.stop_event()
-                return
+            # === 指令穿透: 命令消息不走我们的处理流程 ===
+            _ASTRBOT_CMDS = {"help", "status", "plugin", "t2i", "wake", "sleep",
+                             "provider", "reset", "sid", "myid", "model", "key",
+                             "persona", "dashboard", "update", "reboot", "websearch"}
+            _is_cmd = False
+            # 方式1: raw_message 保留了原始 "/" 前缀
+            if _raw_text and _raw_text.startswith("/"):
+                _is_cmd = True
+            # 方式2: 匹配已知 AstrBot 内置命令 (无前缀版本)
+            elif msg_lower and msg_lower.split()[0] in _ASTRBOT_CMDS:
+                _is_cmd = True
+            # 方式3: "!" / "！" / "/" 前缀 (后者作为兜底)
+            elif msg_str and any(msg_str.startswith(p) for p in ["！", "!", "/"]):
+                _is_cmd = True
 
-            # "/" 开头兜底
-            if msg_str.startswith("/"):
-                event.stop_event()
+            if _is_cmd and not img_urls:
+                print(f"🚫 [Meme] 检测到命令, 跳过: {msg_str[:20]}", flush=True)
+                if sess_key in self.sessions:
+                    self.sessions[sess_key]['flush_event'].set()
+                # 不 stop_event: 让 AstrBot 自己的命令处理器能正常响应
                 return
             try:
                 debounce_time = float(self.get_bot_config(bot_id, "debounce_time",
@@ -1128,7 +1153,7 @@ class MemeMaster(Star):
     async def check_and_summarize(self, bot_id: str = None):
         """v24: 纯粹的总结逻辑 (只生成 Fragment，不重复提取 Sticky)。v3.0: 按 bot_id 隔离"""
         bot_id = bot_id or self.DEFAULT_BOT_ID
-        ab_rounds = int(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50)))
+        ab_rounds = int(float(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50))))
         if ab_rounds <= 20:
             threshold = ab_rounds
             summary_words = 150
