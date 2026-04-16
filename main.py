@@ -590,7 +590,7 @@ class MemeMaster(Star):
 
                     min_score = 2 if len(query_words) >= 2 else 1
                     # ab_context_rounds 改为 bot 级配置
-                    context_window = int(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50)))
+                    context_window = int(float(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50))))
 
                     sql_frag = f"SELECT content, ({score_expr}) as score FROM memories WHERE bot_id=? AND type='fragment' AND ({score_expr}) >= {min_score} ORDER BY score DESC, created_at DESC LIMIT 2"
                     c.execute(sql_frag, (*params_score, bot_id, *params_score))
@@ -859,7 +859,7 @@ class MemeMaster(Star):
             stickies, related_context = await asyncio.to_thread(self.get_db_context, msg_str, bot_id)
 
             # 4. Sticky 注入逻辑（频率由 ab_context_rounds 自动计算）
-            ab_rounds = int(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50)))
+            ab_rounds = int(float(self.get_bot_config(bot_id, "ab_context_rounds", self.local_config.get("ab_context_rounds", 50))))
             sticky_freq = ab_rounds if ab_rounds <= 20 else ab_rounds // 2
 
             # === Sticky 变更检测 (用内容 hash，不依赖 h_update_sticky 写标记) ===
@@ -912,6 +912,8 @@ class MemeMaster(Star):
             chain = [Plain(final_text)]
             for url in img_urls: chain.append(Image.fromURL(url))
             event.message_obj.message = chain
+            # 标记：此事件经过了我们的完整处理，on_output 应该接管输出
+            setattr(event, "__meme_needs_output", True)
         except Exception as e:
             # 屏蔽空消息日志
             if "not defined" not in str(e): # 过滤常见无关报错
@@ -921,7 +923,9 @@ class MemeMaster(Star):
     @filter.on_decorating_result(priority=0)
     async def on_output(self, event: AstrMessageEvent):
         if getattr(event, "__meme_processed", False): return
-        if getattr(event, "__meme_skipped", False): return  # 命令消息跳过
+        # 白名单：只处理经过 _master_handler 完整流程的事件
+        # 其他事件 (AstrBot 内置命令 /help、/撤回 等) 一律放行不干预
+        if not getattr(event, "__meme_needs_output", False): return
 
         result = event.get_result()
         if not result: return
